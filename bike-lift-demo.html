@@ -1,0 +1,1630 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <style type="text/css">
+            body {
+              padding: 10px;
+              margin: 0px;
+              display: flex;
+              flex-direction: column;
+              background-color: darkgrey;
+            }
+            header {
+              display: flex;
+              flex-direction: row;
+              justify-content: space-evenly;
+            }
+            #video {
+              display: none;
+            }
+
+            p#guess {
+              font-size: 5em;
+              margin: 0px 0px 0px 1em;
+              padding: 0px;
+              width: 2em;
+
+            }
+
+            header canvas {
+              display: flex;
+              align-self: center;
+            }
+
+            #videoBox {
+              position: relative;
+              padding: 0px;
+            }
+            div#live {
+              display: flex;
+              align-self: flex-start;
+            }
+
+            label span {
+              display: inline-block;
+              width: 3em;
+            }
+
+            #video_copy {
+              box-sizing: content-box;
+            }
+
+            #outline {
+              border: solid 2px red;
+              position: absolute;
+              z-index: 10;
+              pointer-events: none;
+              background-color: transparent;
+            }
+
+            #crop {
+              margin-left:1em;
+            }
+            #crop_view {
+              display: flex;
+            }
+            #crop_view canvas {
+              height: 70px;
+              margin-left: 1em;
+            }
+
+            #video_copy {
+              height: 500px;
+            }
+
+            #trained canvas {
+              margin-left: 1em;
+            }
+
+            #guess_confidence {
+              font-size: 2em;
+              color: red;
+            }
+
+            .trainingMode,
+            .trainingMode * {
+              display: none;
+            }
+
+            #guess_avg {
+              font-size: 2em;
+              margin-left: 1em;
+            }
+
+            label {
+              display: block;
+              margin-top: 0.4em;
+            }
+            input[type="number"]{
+              width: 5em;
+            }
+
+        </style>
+        
+        <title>Screen Watch</title>
+    </head>
+<body>
+        
+      <header>
+        <label>Bike Riser IP: <input onchange="saveIP()" type="text" id="bike-riser-url"/></label>
+
+        <div>
+          <button id="start">Start Capture</button> 
+          <button id="stop">Stop Capture</button>
+          <button onclick="rescan()">Re-scan for ROI</button>
+          <button class="trainingMode" onclick="exportDB()">Export DB</button>
+          <label>Recalibrate: <input onchange="recalibrate(this)" type="number" min="-20" max="20" step=1/></label>
+        </div>
+
+        <div id="crop_view">
+          <canvas  class="trainingMode" id="crop"></canvas> 
+          <canvas class="trainingMode" id="work"></canvas>
+          <canvas class="trainingMode" id="hotspot"></canvas>
+          <p id="guess"></p>
+          <p id="guess_avg"></p>
+          <span id="guess_confidence"></span>
+          <div class="trainingMode" id="guess_match_canvas"></div>
+        </div>
+      </header>
+
+
+      <div class="trainingMode" id="sizes">
+        <p id="videoSize"></p>
+        <p id="screenSize"></p>
+      </div>
+
+
+      <div id="videoBox">
+        <canvas id="video_copy"><!-- this is what you see --></canvas>
+        <video id="video" autoplay><!-- this is hidden --></video>
+      </div>
+
+      <br>
+              
+      <fieldset class="trainingMode">
+        <legend>Learning</legend>
+        <button onclick="startLogging();">Start logging</button>
+        <button onclick="capture()">Capture</button>
+        <button onclick="clearCache()">Clear</button>
+        <button onclick="clearWholeCache()">Clear Whole cache</button>
+      </fieldset>
+
+      <section class="trainingMode">
+        <table id="trained">
+        </table>
+      </section>
+
+      <section class="trainingMode">
+        <table id="training">
+        </table>
+      </section>
+
+      <sectiopn class="trainingMode">
+        <table id="learning">
+        </table>
+      </sectiopn>
+
+      <script>
+
+
+/*
+================================================================================================================================
+CONNECT TO BIKE RISER
+================================================================================================================================
+*/
+var Socket;
+
+// Use stored IP of hardware if available
+let bikeRiserIP = localStorage.getItem('IP');
+// let user see old value
+document.getElementById('bike-riser-url').value = bikeRiserIP;
+
+// Save a new value of the IP address back to local storage in the browser.
+saveIP = () => {
+  bikeRiserIP = document.getElementById('bike-riser-url').value;
+  localStorage.setItem('IP', bikeRiserIP);
+}
+
+// Establish a socket connection if possible
+let url = 'ws://' + bikeRiserIP + ':81/';
+console.log('Connecting to socket via URL: ', url)
+Socket = new WebSocket(url);
+let socketOpen = false;
+Socket.onopen = function () {
+  console.log('Socket connected');
+  socketOpen = true;
+};
+
+// Log errors
+Socket.onerror = function (error) {
+  console.log('WebSocket Error ', error);
+};
+
+// Log messages from the server
+Socket.onmessage = function (e) {
+  console.log('Server: ', e.data);
+};
+
+// When height is to change, send the new height via the socket to the hardware
+function setBikeHeight(height){
+  try{
+    if ( socketOpen ){
+      Socket.send(height);
+    }
+  }
+  catch(e){
+    console.error(e)
+  }
+}
+
+// Manually allow the user to send where 'zero' actually is right now (assumes a calibration is visible such as CM scale)
+function recalibrate(obj){
+  let height = parseFloat(obj.value);
+  console.log('Sending', height)
+  try{
+    if ( socketOpen ){
+      Socket.send(0);
+      Socket.send(`zero=${height}`);
+      obj.value = null;
+    }
+  }
+  catch(e){
+    alert('Bike Lift Hardware issue - socket failure')
+    console.error(e);
+  }
+}
+
+/*
+================================================================================================================================
+IMAGE PROCESSING SETUP
+================================================================================================================================
+*/
+
+let preload = {};
+let autoLog = false;
+
+// Create some basic info
+preload = {"cropShape":{"w":32,"h":32},"source":{"x":2305,"y":46,"w":89.49242424242448,"h":81},"samples":[],"classified":{}}
+
+// Initialise all sample images for each gradient to nothing
+for ( var i = -20; i <= 20; i++ ){
+  preload.classified[i] = []
+}
+
+
+// Use latest data set
+//  Each classified entry is a PNG image saved from a screen image taken during learning
+
+preload = {
+  "c ropShape":{" w ":60 ,"h ":40 }, "s ource":{" x ":16 84,"y ":79 ,"w ":60 ,"h":40},"samples" :[], "c la ssified":{ "0" :["data:image /p ng;  base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwElEQV  RoQ+2QQ7AIAgE4f+PtjEpTYuo6XHX9p pn    xqZtZs4OWC5jctgyTCzYZlmGyHV  CkyY  QOODIsw2Q7oEiTCVXTUqQVa  bIdUKTJhKpLK9KIkW6t/tLs3n1+F7zhGWxgZmho4B1sBQ0LXMGGzVx7W6YBztGdQUMCr+xGjKmBq24s4PuKooj0cYb  7uaVuWh1wdfW    pCRroB2I3EkA B b4Dz TF4 DG7b 4f HQ npAQBvOcH G uq67 9zNX6 qWV3 +sH rFyF RbQ HAnJ Jc AA AAAElFTkSu QmC C","data:imag e /png ;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAvUlEQVRoQ+2YwQ6AIAxDt///aAyJJAQmiJ7albOXt1ebgZtZsUTHBUxuW4bJBZsMyzDZBBRpMqETjgzLMNkEFGkyoSotRVqRJpuAIk0mVC0NG+lS1o+t7hVtPpDAO9gecwSHAz6BreDQwKewzXQPDWU4Ah4N7r6BBo6KKR1wjfEKms6wgO/mavFPYZimpdOVVrRYULf0uFg8LSawkX5q4NWVFnq1bGBvV8zoH4dq6d7kDprqevjnVQbW8FfoC/NkcwE0htesAAAAAElFTkSuQmCC","data:image/png;base 64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAyklEQVRoQ+2ZQQ6AIAwEy/8fjcHYxGBrwZPbLkfl4HS2gNpEpEuh0Qic3DYNJxcsNEzDySrASCcT+sChYRpOVgFGOplQLlqMNCOdrAKMNIrQ3v1Pca0Nj/aAM/wGOiNa4FDAO7AKP0PDAH+BHdDpgBVotachDHswVo9ac+/zCPzHbSmydn/mKA2whr29lsCXfi0QDaP0sLXHjmtRv8MaLgk8Q0cL1jkf5Yd4uaOl15/RmgN7llawHdPwr4c70N7BBKaHo+iu3i8HfACxjHwBYXgtOgAAAABJRU5ErkJggg==", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAuUlEQVRoQ+2ZQQ6AIAwE2/8/GoMJkRRQPHZYrnqZzlKKupkVO2i5gOG2ZRgu2GRYhmEVUKRhQgccGZZhWAUUaZhQNS1FWpGGVUCRhglld+lSnu+R7jW840JEugeNiBE8PfAbbIPvoY8AruANOjXwjt1oGQUc92ssSH2OAZ51ZQHLcLIx62vQUKRJke7P2hZUtOEIPIO938n8Q/y4waMa24VGjJarvfp2Y0od6R5sZRp3Pfw7OmAM74Jf4YtzASvotqIAAAAASUVORK5CYII=","data:image/png;base64,i VBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAvElEQVRoQ+2YQQ6AIAwE2/8/GtNEkqoFkduuy1U4TGeBiptZsx8NFzC5bRkmF2wyLMNkFVCkyYQ+cGRYhskqoEiTCdWhpUgr0mQVUKQRhbZWP8u5h8/rgDY8As2Id2h64IDP0LDAK3Yr0zTA2WJVjP4dEngG1K2O5ggY4VpaMRwc93kRa1rDAj6vJxlm2cM6pZEjXR1IuYWkazxGwLPtCN1pzbqpCpri5+GLZRrgN9N0DwA7Vyhk47ED2tccPwB8AWSWs3EAAAAASUVORK5CYII=","data:image/png;base 64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAvUlEQVRoQ+2YMQ7AIAwDk/8/mgqplRAkUNhszEyHy7kW4GZW7KLlAia3LcPkgk2GZZhsAoo0mdABR4ZlmGwCijSZUJWWIq1Ik01AkSYTqpaGjnQp+YOre0UbFyzwDPbDjKAhgf/AZtBwwDuwETQ8cB/baCDtHijgFcxntN9HA5w18Www0IYF/Gb6esM0/3AVGsWatrQi4FWTQ5VWBbzu4LEL3UcezvAOMM3lITtRtZdBuuvh6csMZKRPYet3D/LXcAF0GqXfAAAAAElFTkSuQmCC","data:image/png;base 64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwElEQVRoQ+2YQQ6AIAwEy/8fjeFgQqBF1FOH5cxlmO0iFjOrdtAqAobblmG4YJNhGYadgCINEzrhyLAMw05AkYYJVWkp0oo07AQUaZhQRkvX+vzfsZQW3nmli/QO7I3pQacCfgMbQeOBG3hvOg1wZHeMrbcPA+zN6HHALcIjNNqwB9zPcdoZju5ZLPDYvv0nxvGRRs8wuqW9WGOAozLaed2ljPRX4LHN01xLqxaOLKd/Lb2BxryHd2Z2tSdlpP9AX4UGdgGPKK3CAAAAAElFTkSuQmCC","data:image/png; base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxElEQVRoQ+2ZMRLDIAwExf8fTUaZFDYREM+k8J2X2i5Wewhht4jo8aDVADa3jWFzwYFhDJtVgEibCf3CwTCGzSpApM2E0rSINJE2qwCRNhNKl5aMdO/rD62tJVa95IB3sEfMClwK+ApsgtsCJ9isGCO0jOEKaIT55RlZ4Flj2kEDfNfBYzSH4Y8pIj0cT+xhlT1cDRa7OL/fUfkhvpqyLAePtPO40fIK9OzYkon0sbfsTFtdD6ummgVYQZ6ujCpN61+nxwtQ+3kBMTJUwQAAAABJRU5ErkJggg==","data:im age/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABKElEQVRoQ+3aWw6EIAwFUNj/opkwiZEYoLc8SoH67RhPL7Rqxjvngrvo8AY+PG1L+PCAnbqEQ8B6qPfx1vmHCjCKLPE4+OXgXmxaBAS+FDwS+8Ap9DLwDCyCXgKeiY3oWsri4NlYKmVRsBS2hjYwf5Tjv+AkXNqHnGvk9rNYwr03mpaVc61v4VSCqVka8ShaPRjBGphoI2kR1S3p0Ql/G9e24NZlvS0YbVrHJGzgSuOypoU/HLafiS5B69KFGrcWUF2Xpl7gH/9VYBS79G2J86BQS5mD3QqcfrXgImufbsX2MD fh9nnw/jLX8UXBkujSeBMHS6GvAqv6Ls2do9y9TD2pLVnSrR/kKDyF/Y8pDf/x6Bk76fiiCqIG3JI4kmauACoSRpIZdc4PRf7BAU05P6IAAAAASUVORK5CYII="],"1":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAlklEQVRoQ+2Yyw3AIAzFkv2HpuoBiVL6UW9xzQYvdkggI6LFj04aGE5bwnDAIWEJwyqg0jCgpzgSljCsAioNA+qlpdIqDauASsOAMm/p1tb/kJm7wMdTWumroD2igSNqf/FIeO5XWg+P+Va0cT1sYJWGzWGVVmmo0ncLyDya0Lv0aHgPbuBK7+GnXRpH+Auc0kob+EUFNpp2WAFbD1YNAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/ AAAA nklEQVRoQ+2YUQ6AIAxDt/sfGmOUZAmiJvrT8jgB7WsZkBHRYqGVCDanDWFzwAFhCJs5QKTNgA5yIAxhMweItBlQDi0iTaTNHCDSSkBbm3/HZe4sxyVJ+E5ol4jg0wkIK3R4yUj3js7EW3W4phDB/XByGksQvrpgQPhwRXIOE2kiHWE1h9/ctCr0Kl6ywwh+eABAWOGF9NceJTv8RfwG2uRhATo4WQUAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAA ACiu5n/AAAAoElEQVRoQ+2YQQrAIAwEk/8/2mKpEFpLC17MZnyBkx1jiJtZs0LHARZPm4TFAzYSJmGxCqC0WKAPHBImYbEKoLRYoDQtlEbpjSvQ2nxZ497FnZ+USr+BDkQp4C/YDg1wsDud0iQ86U1SSke+Ml16QAN8VQKlM3dp3jBdWmzSQml1pf+MlvcaxG9KcpYGOCwESHjjjc55tXJveDWQdEqvAh+oYmQB1Klk+gAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoC AYAAACiu5n/AAAAqUlEQVRoQ+2YwQ6AIAzFtv//aAy3BRBIvLi3cvZSWifiZtas0HKAxW1jWFywYRjDYjtA0mJCJxwMY1hsB0haTChDi6RJWmwH0ifd2nxD5d6x1isl8Aoy4kkBn2A7OMBBf7qkyxru2b7BSyU9zt4SUzpCA6w2pUm6wkmLd3jovNxnaXe8THfSOuV8+olIB3xztBwneUwc4L9fcGD4wlDqpC/4to+ke4e/Aj8mU2QBkn/6BAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEU gAAADwAAAAoCAYAAACiu5n/AAAAnElEQVRoQ+2XQQ7AIAgE4f+PpjHpgcRamnhoWMdzL7M7KHUzCzvoOMDibdOweMFGwzQslgBKixU64dAwDYslgNJihXJpoTRKiyUgoXREmPtAqU9b4AH5dlYBtASuYEcQAN860HA99v9/cZzSOfIVvNQMA/wwZTTc+ZZGaZQW27RQWl3pL5tWziA/UbK7NMCd3+HjlN75X2s5wzvAF6nXYQEvorZoAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu 5n/AAAAk0lEQVRoQ+2YSw4AIQjF4P6HdmIyCxOdT+KKWm9Q+hA0I6LFQScFhtvWMFxwaFjDsAoYaZjQCUfDGoZVwEjDhHppGWkjDauAka4itLX3r7jM7nI+JQ1/wXZMgW/ZGq7Qw8dFepTyBI/qYYFX44c0ljSsYdjiYaSNNCzSfzatUfq4hGB3aYHpryWU4Z0XXcke3gG+AKmMXgHbbjNqAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAnUlEQ VRoQ+2YQQqAMAwEk/8/OlKwUGxEoadspj/YzHSNdTMLa3ScwOK0ISwO2CAMYbEJoLQY0C0OhCEsNgGUFgNKaaE0SotNAKWrAY3In+TcB8v9lCX8FnRGlAr8FXaEJvCNvqTSbQlPbbMBSCn97F4Cq5UWhJPlgztc+bOE0p2UbvHz8GfTWrVfC0x2tSRw5ZZup/TJq0zJO3wS+AJjUGEBVtXAoAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAA ACiu5n/AAAAmElEQVRoQ+2ZUQ6AIAzFtvsfGsMHERFN/LQrN+j6HBtmRLQodFJguG0NwwWHhjUMq4CRhgm94WhYw7AKGGmYUJuWkTbSsArgIt3a9cUqsyOeBwW8wnZMJPAOdDgVmPBqqeG5Sdm0QH8eynTpkWCBqfewhu3SztKMHfBp4prnacS29DZarkuEwH8Mt4Y31sZ3jIj0l1SWAz4AhvphAV7GTQ0AAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/A AAApUlEQVRoQ+2YWw7AIAzD2vsfmolJk1jZQ+IvwZxgrkMGZES02GglwOa2MWwuODCMYbMJEGkzoRMOhjFsNgEibSaU0iLSRFpkAq3NDzeZPcD3JR/pJ9AL0Q74C7ZDA9yHoPyIh+FaUI6lNTJW43Z7uP5yACbS4i1NpMvxktJSP3hsHem3U1eNtfXRckzABQ6wyH3//My/ywOG1Vt6O8Mr20+6tFaAD3m1ZAE5mdQqAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAA AAoCAYAAACiu5n/AAAAmUlEQVRoQ+2YwQ3AIAwDk/2HBvFARdBW4slxbOCcHTAZESUuOqlgOG0JwwGHhCUMm4CWhgFd5EhYwrAJaGkYUJeWltbSsAlo6ZOBlrJ+z2U2ps9BEH4T2iUqmPBrKeExs9QMt6xes7TGLTyLRi4tBdMzLGEJw56WXc5119LXi2u8mvDlYS4RCj6xD/+VBwkT6uGOKxEZ3hFcAXBnYQGe/7ipAAAAAElFTkSuQmCC"],"2":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAAC iu5n/AAAA3ElEQVRoQ+2YQQ6AIAwEy/8fjcFEDyi0IDHdsl7VxOksLZJEJMtGVyJwcNs0HFyw0DANB6sAIx1M6AOHhmk4WAUY6WBCcZtWzra/2JRKaNuX+0hbQWvEFrhr4FnYC/4NOjRwAa+hCeypS3+NNLThXvftFQYu0tqYKRbDAFuX11bA2jqHirRmeBT2bGKIB/EaKOzGozb8BfQuAorhFbAwkV4FCwFsgbXMaohIr4Z1bdgC2+vGrZHmdiyNAHdPOKoTEAJru5u/7tPwZKVh9tLbGZ4Uqr7mtmmpXz75wAGRX HMBw 1/S7gAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6klEQVRoQ+2Z0Q6AIAhF8f8/2lat1kwDlm0Xuj7rw+EAYhURqfKjVQic3DYNJxcsNEzDySLAlE4m9IZDwzQMGIFa9/G/lDVBfStESh+AFjQtCLDAHsg2EE/QkMBvYK/wPXACW+rk6z2zDPcaW2rDoYF79WjJhPYctGHtilkNatAhgD09gsBNtFIZ1uyGaVpaSltAR7M2ZNMaAVtBnx4WYYBnwG6BQP/zMAv0yBpo4Nmw0Ia/gIUFtsJaJrHbWxmxhn8FbIXV7uqzSTXfveCaFoGtKgf74GdpGqZhXwTgU9qH49 8N16X9CL4TC50kfAF6hzirAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6klEQVRoQ+2YUQrEIAxE4/0P7eJCS+laMpG4TNL4LcXnG01sE5EuLxqtgJPbLsPJBUsZLsPJdqAinUzoDw694d71RrC1gYENWmAEdIaowVMBr0JawNMCj02Y2S5g7OjvmeUZ6WOFd8upDc9iHQL4bsmShDCGtfIy7CHg9MAI6HE+wwNbr8JXASOw9JcWangV9rsBkf5aoqBPNTgMsBX0qa0MAewJSw3sDXrGnPEMW2EttZvu0toJSxfp3bChgS0xvtZ3mkj/wy6VYSsw2pXRvpYKGFWozCvDLI1HRTp7pJ341M /Q1GF1pU4TPiVBhQGcUWugAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAy0lEQVRoQ+2YwRKAIAhE8f8/2sYmZ9IyxC7ttp69PB4gmMws249OEjC5bRkmF2wyLMNkEVBKkwm94MiwDJNFQClNJpSnaeXsb7UplQRuD1xKz4CeEXtoKOAobAU/Qwv4y01r1XBhqpahDff1+RQQeOC7DlxMjqAhgWfKTcBHlCgNe3b35sXwL+11b9h3+K6GI7DwhqOw0MArsLDAq7CQwG9g6YBH01ezLiI9S2/twhn2gJ9GT8hJS8Az2wTyLC3D7IYDfMOrFNtSJBAbKc9zAUdeg+8AAAAASUVORK5CYII=", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA1ElEQVRoQ+2YUQ6AIAxDx/0PjdFogigWkagd5ZeQ+PbqJgYzizbQCgJ2bluGnQs2GZZhZxVQpJ0JPeDIsAz/uAIx7q8BIcyBvV50kc4hS3gleBrgWtC8ADm4e+C5ACm0gNFL/9V+a6SHNJxCU0a61IGvUrCdoQJGc9YVcE3vEPBaJcqxhAzX2F2aF/tv2ppx5cbwXVhqwy2wtMCtsJTACBbNaqqm9RSWynAPWAGj4f7lPjKMno3q8vAUlu56KGCU35N9RbqhaK8dGS7SPStL9aXVA3wC55p8AYb7qXwAAAAASU VORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA3klEQVRoQ+2YwRKAIAhE8f8/2qamGrMQrQ7ttl7r8niAYDKzbD86ScDktmWYXLDJsAyTRUApTSb0hCPDMkwWAaU0mtCcj8teSrND/0AariE9vCt4KOBe0DIANTQ98AxfQgv4y03rTkpvPJtlaMN1fbYCAg3cuno8aEjgnnL7FTBdSkeGI7vLFcXwLh11b9h7+MrwCCy84VFYWOAItB4nD7M1Yg33dGN3g0IDfgILl9JRKkfLPx1wq3b3JQIppSPDzaed9ekHavAQcDRrFt8htyUZZjc8wOf+CtW03gCeAJGkdg FaSULuAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAy0lEQVRoQ+2YQQ6AIBADl/8/GoPBxOjCAl5oLVcvzk4pSjKzbD9aScDktmWYXLDJsAyTTUCRJhP6wpFhGSabgCJNJpSvtHJ+/92mVILrL9hIe6BPRA8cDngEtAcu4N1LS4YHDV37GTrSXim1EgAN3Dt26ICjBAu4Tgg20i3Dvfa+bwG40vKAo6OKCngGtgwL2vBojO+pgAVegYU1vAoLCfwFVsDRV8wOz6NWbt501FsQqNJahT2jLOAd8hq8gwxPSIKM9AQf3zXtKvwBABFzAWY82Q0AAAAASUVORK5CYII=", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA1klEQVRoQ+3X2wrDMAwDUOf/Pzqjg8HI3Fil3RapymsvcCy7SVtE9LjRagaLp+2ExQMOJ+yExSrglhYL9IPjhJ2wWAXc0mKBany0es//aFvbGna+aFp6D5nxZvDlwUegIz6DLw0+g33hR7TB1dD/8roTjohsLqvCvD9D0dLVdiMDRsfH4KFSNC2NJHwk3e19S8/wDFxBn7jkqEkHRqB7WKqEUegMKweuti8aMJIugqUAX4ldHnw1VgKM7NU0Bw8kYYOTCjhhpC3+cc/tWvobRaY7S58twgOtiXMBN4aiswAAAA BJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6ElEQVRoQ+3Y4Q6CMAwE4O79H3oGEwiRsV5nNNdy/BWN3+7ops3Muj3oagIXT1sJFw/YlLASLrYCqnSxQC8cJayEi61Aykr3fv2909pG8S968AjnsWZ4WvAK9LwQd+iy4A0/QpcGj9ACewPhX68jkxh5zj9rTZ+wt91E0dRgD7u3zUOfP4cWjD46Eex7iGX/1/IxYA+6NyTN0JpVehWbrtIo9O6UlQYcgc6wKcARLLKNUU9pFItAjyHGui39AktdaQQcSZY6YQSLnsRS7MMCo3EO7lPCjFNala5e6S987lupT1 rut1+44QUppnwBEqJ0wgAAAABJRU5ErkJggg=="],"3":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABGklEQVRoQ+2YwQ7EIAhE8f8/uhs3sekaZdCtyYh46UFt8pgB0SQilxw0UgA7VzsUdi6whMKhsLMI0Fr6uvT2IKUkeU3+jgwqYASJwCzwFMD/gtaB0MADGNlmxXwo/EJUe7Z2aekSrxY0HbD1uLGkAT2w5Vgp6m0NPJOyxwHnIGnQ1EVrhcJbArd6ZWRlVAcoqrSmMAJ87kWwea0bYAtsAM8Uj9V7RiytdVj3HPO79Azs17bKowB9DtcOsgZhy2MJpQuCp+2lEVhv/jhg1F628pkih2deHy2w1MCWI+Vpb WTn3 v9oFJ7NY7SvLlyugWmrtNWeSE3LRcKtwtSNx9sK07eWBbi8WI5Y12LjnzU7Xx6sd+BtgGeV1vZ9ADm6nQHU8ihCAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA5ElEQVRoQ+2YwQ6EIAxEy/9/NBs22QSR2sGYDR3Hsx5eXzsUi5lVe9FTBExuW4bJBZsMyzBZBdTSZEJPODIsw2QVUEvvLrTW8+WulOYNe7Y2PINDsK4KQAnciuJB0wJ70NTAM2gBI6Hwr3f60PJmMgq28butDaOFvYIWcPa/lit2vyGWCTia134EUp7D4wwjwNGaSWk47Wp5x/Dvm9e09FgkHUuZUtpbRKIw6y2nCi1qYGSPbgWI7I43pm0NIyDorp2ipZ8CTpPSAkb7t3tvtnxQzjDNaumlcnRhONyiGBaPlW 7/AKjkeQG4/Wn5AAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABFElEQVRoQ+2ZQQ7DIAwE4f+PpnKlVAgBXlNaLcY5JhwYxl45SU4plXTRlQPYue0w7FxwCsNh2NkJREmzCC0Fm4dyFmf4RWVYIAUAha0xUXAa4BXIkdcZPA2wbP4f0AGMt//+lTsNy+56pU1tuBdgaKiN+pgG+LGLpq1WDfTA1ga5DhhJdfoe3mnZVUmvlvM7udm/aWlw1vHSDTCa7gFsDY5fr4+SBk/42JTuGf5mvKTvYU3orOTdDR7atHUdcO8V8eiSRhK8tUwBXG8cHSC0cn56nx64Dal2w4jV2bhJZ1hLZe vz4wxbAUel/LnP8LZkLVPkEKgnrZ3AWuhR9HCduOjYuPLX4fgPAJrN3qHQGEb6cseaF/xNmgENcq9YAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABDUlEQVRoQ+2Z4QrDIAyE4/s/tMMNhwQ11xa2XEx/lSqFL3eJUYuIVDnoKQkcXO1UOLjAkgqnwsEiQGnpWj+tQylFxndEGyrgDrcDa0HYjntvPBDIGeAK3L3Cd4G75XUwEhhJ/F/OeaLwTOXQCndhxnymAe5LkC5GiAPogK2lxoKmAkbrxQ76KGDtDvc5/FRheuBm3RECtfK3YntvLbXCVoGaLUXjP+gsjQDvqnoCo0XiX/MQhVcbh/f3qDlMu1tCnGSpHrLxaIFZgScwYhuGOfQK665qF3Q0j91X6Q5twYcAti DQNKMpWgmMSqrmHaUw3X74rq2pbx7GSzPL1avTTdoDAAvYGne/DlsAV8dfm36gAVz4FvUAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABDUlEQVRoQ+2Z4QrDIAyE4/s/tMMNhwQ11xa2XEx/lSqFL3eJUYuIVDnoKQkcXO1UOLjAkgqnwsEiQGnpWj+tQylFxndEGyrgDrcDa0HYjntvPBDIGeAK3L3Cd4G75XUwEhhJ/F/OeaLwTOXQCndhxnymAe5LkC5GiAPogK2lxoKmAkbrxQ76KGDtDvc5/FRheuBm3RECtfK3YntvLbXCVoGaLUXjP+gsjQDvqnoCo0XiX/MQhVcbh/f3qDlMu1tCnGSpHrLxaIFZgScwYhuGOfQK665qF3Q0j91X6Q5twYcAti DQNKMpWgmMSqrmHaUw3X74rq2pbx7GSzPL1avTTdoDAAvYGne/DlsAV8dfm36gAVz4FvUAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA2klEQVRoQ+2aQQ6AMAgE6f8fXVNjE1KtUrx0YT3rYRgsbLSISJVEVyFwcNs0HFyw0DANB6sAWzqY0BsOlOFav5fCUhrS/IIAtoCOiDPw7YE9sBp+BCfwbofWX8ONR1sObzgMcLdm6QBYw28j5w0cCth6phBYVSqVYbg5/NTSloOqP5cGGHa19Bom8FW57Tctr+F07/AsMUEaXrUecg63Ili2rTCGCTz0fW/r7Q3rNvWmJZ2JoYCtyenpPkjDBDZWAGosrSSjGX8qYMh46LGcIi19fVc6x1O2v3gOJcOIAYidJs sAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABBklEQVRoQ+2Y0Q6DIAxF4f8/mqVLWAwDbrtpclvqiw9i4ulpr2gtpbRy0FETOLjtNBxccEnDaThYBbKlgwn9wqE23JpuE1irYOgOSmAt6AwRwVMB/wN6hd9BJ7BuEp5ZdZfh/nQz0yENuwVezaK2E1wYRil7HSYETg9sTYYEHip2lOHVaFCl9KylUdtad1uhgDWBl8DWpHx6vbWlkeVQhnc7rM819h/xVsMImt4wGhlUkLHF3QNLQXbQCcw+w6ilXRuW1pQW7GcEi+ZX7qdu6RVAL0IH0ICu0poqtCwgyP6RwP Sfh3cbPgbYzX/pPne/mkYfDu/Q8/IenhVBAziGmxtgbSqjdS8FDJEBYwA5lAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA80lEQVRoQ+2YwQ6DIQiD8f0f2sWDi3H+YjO2UMSzl4+WghYRqXLRKQkcXO1UOLjAkgqnwsEqkJYOJugHTirsSeFaz7feUpp2+nGpMAK6QtzBuwP+FrYV4DrgrvoKPKTCCTw0eiqsB/tvb4yhpY0aLeAoehgt5w46gdvIYv3T0uz8NI8pgE/g5lZ46v9wwFrQJTCakv+4j1qaapdeFRAFplotLYFXSU3Rw7u20dSf7U0P3IqBbFvhgWdbuwJGHg7d5pqlaYAtx93Yx24VtgJ2HVon9kQLcRWw+/ewpcI0ryULaN pdGoHXnoXv/Zr1xwMNr37/BeV9ggGXgQ1+AAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABIElEQVRoQ+2a4Q7DIAiE9f0f2sUlTZYOy4E1INK/08yPu0NtWksprRz01AQOrnYqbClwa7J2UmvXS/aYKyyFvONJoc2AZ0G14GGAfwvwpHoCy1qAfvTblkYtngrrNZPNTIVl9WJHjxqXuaWl+yjqDHfArESDAccB9zpw0C734ZUKhwHmlL2KuBUwCkU5BGmAZl16ZGktMALb/zMEMAqbwNrO+eY8raW/6gFvQEJYGr0pubT0k1tQ9bfalpB4zIC7szQCjBwvR5kODUxBhwamsmwCfGUQ2UYoi2+XYWrBKDwK6y rDkkWjTWw07l5IU0vPwnDz3WWYW/Ds70cBu3qJtzrD7o6Wq4CRTm/StNCjoSTDCKzL2xKqPgr4d3U87SueDzV7mgErIamzAAAAAElFTkSuQmCC"],"4":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABBElEQVRoQ+2Z0Q7DIAhF8f8/2sUlXVqz7SJQhUpfJw2nhwm1hYgqbXSVBH647TT8cMGUhr0arpXXTEppDn9fIQxzYRtmAneyXRseMXtwhTa8FbAENux/WAobElgDGw5YCxsK2AI2gb8MXC76MLJ79Fa0LoRhBNEPEqPre8nLDY8CjK53BSxJXhJzhl5mWJq4NO4za684xNMkrYl9b2qzgVHCaKdF8a7ellCyCLb9ju6xHTB6aNNKGplBL/Dc+HDA1oeIfYm7M5zAyieQhmf14ZFNRyn1Ep6GoxhuprhVc l67z LBVmXKg/01b09rSLGBXo6UFNDKcwJE+pllUhKsjnjuA0D1f1FOsARilNUwAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABDklEQVRoQ+2YUQ7EIAhE8f6HdmMTk66JHURjmYq/iuExCGoSkSwHjRTAH1c7FP64wBIKe1Q4Z30jSalo2B/uFR6BLZgB3IjtVuFRZSsXrcIBrKymlApb1aUrWjOglGf4KOAVsFQpfRQwgq2VF61zr7AFANm4bksW5y029xb+2tUSOd5LT2TnUuEZp2dsryDu/sRDDqPCg+xdKYycRbBlHu1BBYycpQJGyqxQV3Of3naGNcAVWru292IsmVL3aLPGHbDy2ateFsC72tJsmqolbT/tmm/bSGlrJJFdKIwitGietm jdW81ILF4DHnGyt1Z7LJ5ubNuK1gpgqqtlABsioElp9AChS2lDnP5MjgP+AZWqrAG0Cr/FAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA90lEQVRoQ+2Y2woFIQhF7f8/uoMHgohBpzHMW8/WuNxbJ2oA0CHRagUcXO1SOLjAUAqXwkYq0HuH1tCQ9OLiXFgaIXYWVRjzwLuwWJgCnuxhWuEv6rpWOA3wV9DhXHc9nAZYCupO4VTAp2BdTGkOdh5CXKx5YA5gnbhcfAEvl/DrNy1Ksaf/qWuFueTDAHOgVB9K9v7PvfFMu2vjuQ3dAXMJc68a3H5TU/pNstT1ULpf3dI7Ce886VCxq2NUe7iAT8lInFMKa/6WytLRLY18Gipj347vXO3hE4K+KZi7RzyqMA X8UJ00Co/eDQUsnQOqV0tpsif2/wBilqkBKTLRUgAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA80lEQVRoQ+2Z2w6DIBBE4f8/moamJFtj3Ys22VmGV9B4PAOL0ltro23UOoGL26bh4oIbDaMYHkMvLr1Pn98N0nAUdqITOHukLXbfJk/iDGfYCktgEVuYOeyxC2/YC0tgtEhvYzgCumRClqUr4Amk9Z/tKdKu0hYYyxiIvbQW5RXX8sDHeUlgWX4Q9tJeY97x6T4evADe8TDAv2oqNHDk4a2ruSxNKeqw9uB3f0rIhGwBLL+eCHw3PpHr/x1pGo5YefIaGn7ybX7utVbqFItWlE9LRpmjlvWCIpuVsoYhf/FoUa fh49FoleNSzfxVP/QcjoC/AO5uowEHH9XQAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6klEQVRoQ+2YSw7AIAhE8f6HtnHRxLSNwpREB3ENhscAfoqIVDlolQQOrnYqHFxgSYVT4WAZyJIOJugLh07hWucXw1Ia1veiAtbANswQwFrYEMAWWHpgK2wCP2bX1kMLUZda4WOAUdC7eqmOpRlsg9HY0Fw8RjC9clq7J/hWQ8sCYbHtoSmAv3qSGhjpSVpgNHDUb3lJo4GjfkuB0aDbEEJ9lwEjfXtP2z++2wJ7fjX1Uz6BPTM72mtWlp5xpMKe2dTudaTCmpePNoEjuy1K+i8I3TmcwMYMpMJdwqi+eIxCm8 2X3bTMkTo5XLAamgFG1hVPAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABF0lEQVRoQ+2Y0Q7DIAhF8f8/2sUl7RpHRYQhdPjWVAzHC0goAFDhj1ZJ4IernQo/XGBIhb0qXOvnMSmlwPX76nP7N1ohFL6Dw8DCA3Ng2wWEBubChgZegQ0LvAobElgCm8BIGXf1LEnVDaWwBmwYYC3YEMAzsKNWsk9T143HLOwBxd2Ptp47Jx4UQK8Wtd91SK84v2LzFfI7FJY4Ttm6y2HK4VFYSmwPpc0bj5HTlDoJjLWOXiYeGuponGES0jOOnjl2o5DGGe/6YFGlOc5iA7lVe6wAugbWmKD2hdAEuDkuUU kCnsAWOZwKS2KUabslpHfl77YqzRQF3T57aVR7alalraATuLvpVFgj9H55BpXLjwppjYt8AWPQrwE44ahnAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAx0lEQVRoQ+2Z2wqAIBBEd///ow0jQZLUVaG9jO9FZ86wKjERJQq0GMDObcOwc8EEwzDsLAFU2pnQBgeGYdhZAmYrnVL/zsOc0doFYO0NHpkt3+/GcCjgWdhs2bxhCax5YCksgKtJrHpbWjFrekp/AZeB1AvE3NAawWaTboBnYAH8OiKaqPSs2cJmvtIAflR+1VMa0H0g0fRvaWff7d3y6sAA/Od9GIYPpY9KHwpy+zXhKi1NzPzBA8CDBMIZljZC3UlrBUD6zAXLJIgBEOk14AAAAABJRU5ErkJggg=="],"5" :["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA9klEQVRoQ+2a2wrEIAxE4/9/tIvLClWaJrHCJnH6WGzh9Mx4gRYiqnTQVQCc3DYMJxdMMAzDyb6Aq0jXundLUErDG6+0wHewDR3A/6zszkjD8M8kIh0l0j2yvQZzhNt917O01F+uk1ZBoSK9A9oNsGT4u4bebCTCGgawQZ3FfKhIa76BBJ8OWOp6WuDw67Amztcx7vfSnJEZVDObP4G7ibTVoAbc9dbSCtzGr0CHNQxgJiJzrGF4pUtvn+HOtNx7Nd3tz7o0bAXQjnc7S2sBVpIU3rAF+jjDxwA/HRFdL Es7O xzmPNy7uQIvQQ6HCfzUYpkGA479ANQLlAEOEJBHAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABGElEQVRoQ+2ZwQ7EIAhE8f8/2o2b2LiGlsFtk8HiZQ+rh8fgALaISJUXrZLAm6udCm8usKTCLArXWqWUIu13dbXz86JV+B/QEXKGTuDV9Hni3B0qh1G4BfBVwHfAtqCFUTiBJ5PQSs7sI720/bg26/BwpTACe2aiIctSAjtqYirsCNajW607PP+PpnlIha1IX8FvCdwDktNS67wi1mErpcOOhz0lNYPytJ5jatMqjKpogYcZHlBgZIzcSuEeGKtuH87NaloehS2VU2FvNNn2e4yL0qW1wV0LsgWqdVy0wFrzMA ZiBfb7xsVoWigMerXoTetO4BCNRwKjuTvsO5uJt73D4YBXPpUizzyUCntqLgIZ4iF+4dpCRz7bB6YBrD9TOAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABEElEQVRoQ+2Z0Q6DIAxF4f8/moVlJIiIbQe21OvLkkUzTs+lVRdDCCm86IgAdm4bhp0LDjAMww9UIKU1kzHGHODjYSLSK4B7sBkdwA8k+PQTMDyh6oj0r4hu9/C3Qe3apa/iKUn+FoZdAVM6NIAlWbbStGBYYI8TefWmRTHMqcEdvDvgq/lbiqYOnBcy2/IIWh24B5tjmb8vn5xI1+eavdPiAHHT0EKrG+bA1udSwF0YLtAU4N5edm0YwFbeaUn28ZaRLou+uztqC0KFNRfpduGjuSudyabGEseUJPbmxhKAJR o714x6guocXmX4NcCUbq9qeOajIQXWzJ9p7UNBvfjerC6PjpItr25Ysuh/rvkAXqudAUTQ2aEAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABGUlEQVRoQ+2YURLCIAxE4f6HroMjjqOkbFIwgW4/lXb68pYUyCmlI93oygTe3DYNby440fC/DR/HnI9EzsXl7+Vu+HbAxcEMaBp+pZuRZtOaXIEZ87e88vJzWALQ+lhiDo+CfZr33i0hkSawNscf42n4QvFMt6KRbo2zRH0Jw71KasC3AK4FQcC3AkbAXYGR+duLs/R/yJWW1Ijq7+WlrUUJCWy1hxahBe0aaQIrKoBY3sYweixE4Ai7JUWK30OROEuHAG5Nq7w0sjL6LggKKy1C3IBb8/CsAFrQcIbRxmOJfN gzLYs1tAAhV1oERvV1xp31AremNdou2vHdgGvTurIjqs1J84lzBZaS2bOP2mw9PyTwoKncfMwD6wqgAehZtrwAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABFklEQVRoQ+2Z6w7DIAiF9f0f2sVkLtuiHBBTUOnfiunH4SI2p5RKuujJAXy42qHw4QKnUPhJhUuhG0TOVQ/Z0/Yc2ZoqjIBlqL+rrwKmIiMU1oSR1DZCWuoxYv1VOVz9sD3wTIvqBYD7orUKtMEH8MK6AbfiVOlQGLqRXuA+pKmKO8O+BfAIrIZ7TQtJ2G8N/O8IDvhRwJ/WQ4yVxwEjlY8DRiqbAyNFGgCnZ3Ny2hR4pq1wwV0ODzPA1UYDvZ3CASy8BAiFZ/PqKTtu/o7O4CYKjz66V1klgG7bEoJoQ4E2an oOdKWwFvDb3lUfRgprwd39eQhgraRve8653CSHJacl5AvprYcZsGYKQiMg5SRzYKTg6vcvz+udATzqNmIAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABFUlEQVRoQ+2Y2w7DIAxD4f8/ulOmIaGOS5KmEMB9ZoNjJw5tDCFc4aAnAnhzt+HwKIOv693oiJG8/H+mOQxg49KCwz9BUdLGlVX9O/SwsdLL9nA6eF4RNZikGa1dHtiqANyHVs9NqRAAliqmXc9NaTisVXiVi0fN4VYStzRx38McQ0kUrgBbAOei9Hp+O2CCb0EDmNMzFmu4Y+nJXiWnpzksBdEItDRw/mLAFQvAFGgrfoiXlPfdZQBz+2PWOom7pZk83OF04N6NqCToU9ivAKN7uHRoDrwUtnbjcgH8Vnu4GE sap7SCHAPs6uVhhMNHAfcCcKvQ6sFOGUu0qXVZc0BT8A13uJa4EhEkgPf93ABrR4/0dx/lL6MBufuz0wAAAABJRU5ErkJggg=="],"6":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABN0lEQVRoQ+2ZUQ6EIAxE4f6HdoNZNiwBOoWaFqyfCsbXmQ6KMYRwhRcd0YEPV9sVPlzg4Aq7wsoVuK7/VTPGGOpz+RHTNeowa+keFAn0LUgP3hzwLGirEC1oB6Ys8+R1SXXTc5pWWBrWLPAqKDe11XuYA4wsO0nZfE9zlkZhUVAkX1QVduCGRJLq3kGmtQGAqCsNqwpchkuv90rgVCAqkfOYUS+bVhgJIfSV8veBYdnSs8Cjr6cjFS4LVeeAA6/aCJ2PpHRPqZW5phWmliUE3IyluctSzzlcaDWFpYC59 3FgN HQkxnHtOGvrso+3V5hbNFVgpP96WzXo3Hr+FsCr7WPG0hkEseUstKl1uIR4AtrcnlatmiT0Nr9aOGGEbBzUY9RDa9SbXMWpd+87sbU2AGZDaHXe64A/SJmyAZKM1F8AAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABN0lEQVRoQ+2ZUQ6EIAxE4f6HdoNZNiwBOoWaFqyfCsbXmQ6KMYRwhRcd0YEPV9sVPlzg4Aq7wsoVuK7/VTPGGOpz+RHTNeowa+keFAn0LUgP3hzwLGirEC1oB6Ys8+R1SXXTc5pWWBrWLPAqKDe11XuYA4wsO0nZfE9zlkZhUVAkX1QVduCGRJLq3kGmtQGAqCsNqwpchkuv90rgVCAqkfOYUS+bVhgJIfSV8veBYdnSs8Cjr6cjFS4LVeeAA6/aCJ2PpHRPqZW5phWmliUE3IyluctSzzlcaDWFpYC593FgNH QkxnHtOGvrso+3V5hbNFVgpP96WzXo3Hr+FsCr7WPG0hkEseUstKl1uIR4AtrcnlatmiT0Nr9aOGGEbBzUY9RDa9SbXMWpd+87sbU2AGZDaHXe64A/SJmyAZKM1F8AAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABRklEQVRoQ+2YUQ7EIAgF9f6H7sZNbEyj7UAtsF37rYTxPcCaU0pb+qMvL+CXq70UfrnA6ScU3rZ+X825pC/7wgGP4AgWOYBQwHdg2wM5Aw8BPAu0QocGng1boBdw43c3Sz+hbFhLa2HPrNrGDGdpCTAZNWRk7ep7/DxQ4Nmw34ZmDewJu4AltaBdSxR+wsouNUxgexcHso8ekmkNk8QrcFlbIOgeMoPNa1iavLZswsxhK+AztUNaWqvscV9P6VcD9xpgaOBRLUpK4xgjJDAZMRTaFbhYjCRKgLWxTBXWJjlqYp rDW8CzRsJMVWbGMleY2vrqMY7GcW9aNNGruzGpX/c53FpTkjBdG+6mpQHW9pTRaHOp4QqhVY4cQkhgaT0T0Ktm56rwbIuTG1oY4LtqE1jzFw9qyQpPnngo6D7mrN+lJdBPrP0Am8i4Aefae+YAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABLUlEQVRoQ+2Z4QoEIQiE6/0feo8Ogi60tFyY6dq/iyyfo6O1OaX0pD968gU+XO2r8OECJ0qFn0f22ZwLzvihAdYgNTwNHh7YC9omQIKGBt6BreA9NCxwBGyBpgCOgr3ARXG01dKjrmRKfTx8SVuALfNWHVdICr8N++1pFuAdVX9mMwuw5LizNVJ6fxVeyVpUzKiHLY6sbVe0Je1NLPwubXHpXWiaHvaCUhwe3lC4d3dKhWtvWhPU9jIdsMetpcsAKuDRtjVTu8bSAM9WS+sMPwa4lK/lNvMCr867qDhrafbfO6 6HZ6clSuCqmlflGWybLKgeHhnPTsvALh4WhVfA4YEjlYa/tYxUGf48LJWrxZDEuyvl1ymcaUVAj9ZQCuA2CZb1cWRsdMArLt3GfACQbq8BONsaJgAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABN0lEQVRoQ+2Y0QrDIAxF9f8/usOBYIOaG6vLnbVvHTo4nptojSGEK7zoiQd4c9vH8OaCwzHMZPi6bBtIjMlf/6E0bAWtIbbgaYBnQGbwnmkK4JmwGrQ78ArYBE0b6dcAj4Imc3Ju67dqM/M6S1uBkS0nA6b/poq0BdYCqu3B39r2MIwCz4Y9wEgkZoxBDK+wS21YArcWKXdodIFoazgDIGkoU6eB0wI/KR26s7TV2ih8DXxLw70PiK2Bax8RfwFciyZaFnIuLbDWbZO9EegDPNoRLfMQM4hhxPJWkT7AjZiVlm lruHcvVXJp5UERaSSK2vlYA20dPlwMW4EtDVGOpTH8K2gq4JXQVJd4MnZoPVqiTQ082zTd93DP1BPbyOnMrUsj8ZQX6uV7XhgE8rbFedxLI7CrxnwAMe+7AV6ijpIAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABMElEQVRoQ+3Y4Q6DIAwEYHj/h3ZxiYtx4F0R6KXib4l+XEvnckppSy+68gIHT3slHDzgtBJWSXjbbMMj5z07fEklbEWWeAguA+6BPTbgDu0O7gmVB4/A7mjJhEdhw4DRYXTeQLmE2XQREg+h/ztcDi0GPAL7LffZX0ue2AVu6QnrGpTwqFL+zeiZJY2waKRc17dszrQeZrA1MFprgcuBrS1yvR/hw4FRW4QE36HDgmtoaXCpH9EBdu7p0npJMDp4dhQDdwU/ecnayY3Q7mAGzaR7bAACl/p4WkmzL/k6MJqj5/ IOkXBPsEQPM33MoFvSdfkeZsF3aAbr/sPjOlrYl37yMSFT0paUW8G10376WLKesi1gub9pR5Y3muOuCfdMG0GPZ8mAW/EsVBrc0rfsmg+0Bq8BIukfOQAAAABJRU5ErkJggg=="],"7":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA1ElEQVRoQ+2YSw6AIAwFy/0PjcHEaIixFWjo57HVzXT6aqUQUaVEpwA4uG0YDi6YYBiGg1XAREvXqrcKlNIQ7xMeuKE+oQG8I7KaLQ3DFnZpTcPphpZJ4JG5IemKHvbMs4WWBrCgAqkMj8K6bWkO+C27V9O4yzAH2y8afToALJgX216Ztesuw6mAV8C6MswBf01mcxcA3FDgYLnJDGCuwjufr7TrIsOpgFfDmjecClgD1rRhAHefCumi4eJvScuuyZaWwP7ZrFwY1lx03F0AzBYjHfAB2b1/ATcpIawAA AAAS UVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA30lEQVRoQ+2YUQ6EIAxEy/0PjdFENyGuDmwLbXf4VpLXNy1oEZEqf7QKgZPbpuHkgoWGZxmudc7hUMru9LOWGSawUbRoeNXFg5FmpHUq4KaHe3FGWyAs8FmgHvAWdt9j2Tnca5jALxW7sxvO8K9xTgv8zW4oYA27KYGf7IYB1rKbDvjNbghgTbupgBG77oG17RJ49H5r8Z6FXdeGUWC0d08pbr+WEOBe2PCGUwAjZq94Nj/ZkVniMtIodHjDlqAuhxYKfAyfgTi7G1oo8CisK+AZsARGxnr0Z1weS5ZF3QBBSY gBVm4+1gAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA4klEQVRoQ+2XwQrDMAxDnf//6IyNFUbpImfTwXLVcwl5fsJ2RkTMuNE3DNzctg03Fxw2XMHwnPzBMcbTbdQ0bGBC7GyYUETaEY40oZSONKGItCPYkT7slh1LO5XLFMfAOxWt9i8y/GlXPtII9gX4XikPUfKPhxX0GVba8C92DVytIa3ugwxfxVnWMIK9albSTQsBf7Pb1nAr4H/sShq+FTCCXTUr2aa1u1mdR5vUaokMr5qVnGEEm4mzVNNCwBm7MsAINmu3DXDWroErvpaYcZYwjIB34mzgipFm30lq02LAPw C4eYgBqtEufgAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA40lEQVRoQ+2YUQoDIQxEk/sf2mKhtEi7OwpTkzj+r/B8E5PVzazZQcsFXNy2DBcXbDIsw8QTaI3fEd17iN9ra6QFTEiTDO+ctBRpRfrjdnW3lUSEquFVoTPgRwGPsP2At/ZhtuESwGicv8GmM4zCPsGGkfKVplSRRoF/waYyjMJe2S0JfGVXwKttgv0dGuc7uykMo7B3tZvmlkaBEbvhDaOwqN0ywKjdEsAzsKGBGXEuAXyU4VnYsIbROJcAZsKGNHwUMAo7M2iMc36oBwAUeKV2w83S/4ANWcPsX81QkWbD9v 0fXEaIAc9GA0cAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA40lEQVRoQ+2YUQoDIQxEk/sf2mKhtEi7OwpTkzj+r/B8E5PVzazZQcsFXNy2DBcXbDIsw8QTaI3fEd17iN9ra6QFTEiTDO+ctBRpRfrjdnW3lUSEquFVoTPgRwGPsP2At/ZhtuESwGicv8GmM4zCPsGGkfKVplSRRoF/waYyjMJe2S0JfGVXwKttgv0dGuc7uykMo7B3tZvmlkaBEbvhDaOwqN0ywKjdEsAzsKGBGXEuAXyU4VnYsIbROJcAZsKGNHwUMAo7M2iMc36oBwAUeKV2w83S/4ANWcPsX81QkWbD9v 0fXEaIAc9GA0cAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6ElEQVRoQ+2YWQ7DMAgF8f0P7cqVKnWxVYihfZjn78TSMGxJE5EuhU4j8OG2afhwwULDNBwUgd7jp2FrI4Ffz99S+hfAA/UdmsBBGfxxLQ0HRbpUSkM1rStCrWWQHngEyQJdCngGex9T2T4PtYaPAN6FTWdYA7wy+2iSaVJaAztbJWF2aetYKgXsBZumhksBe8KmMEzgSbf7NoqeX4EeS952oVNaA2sxC794EHizdqENR9mFrGENrGZnXq2uUF1aC1sO+Ep3hqxhreFSwDuwUE1LY3cXlsDWvxDez68se5iFbF reAZzddwOt1IgBgCogWAAAAABJRU5ErkJggg=="],"8":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABIUlEQVRoQ+2Y2w7DIAxD4f8/uhOTOk0I4qRQxUD6XGhP7Fwgp5SudNCTA3hztUPhzQVOoXAovFkEKC19XbbRIOeCoXuogK2gLUQETwM8A/YOgARNATwTFkG7A78BW6B7KtMD935cE6jWWmpgVIAQdAAXq3sfDyWVkMIlV63rA1g3r8x760ke3l+3qvut3t6WRrb8D21t8R7wUYMHynsKhS0qo2QK4CpC2yksjZXLFS1kZ6nA/Q4V3lXa2lpQG0PQrpZGP48KEFrfsncAW/Jk9F2kEFJY087qPZZWeClgp C5qL 5p5miqHZwA/2YPa0tKFnAaWSmFN/o0WxeWueEaAaW8t31Ca/jw8Exr1btei1bOstiBJRa23NyXwSO6itccBfwAdB68BvqSMOQAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABIUlEQVRoQ+2Y2w7DIAxD4f8/uhOTOk0I4qRQxUD6XGhP7Fwgp5SudNCTA3hztUPhzQVOoXAovFkEKC19XbbRIOeCoXuogK2gLUQETwM8A/YOgARNATwTFkG7A78BW6B7KtMD935cE6jWWmpgVIAQdAAXq3sfDyWVkMIlV63rA1g3r8x760ke3l+3qvut3t6WRrb8D21t8R7wUYMHynsKhS0qo2QK4CpC2yksjZXLFS1kZ6nA/Q4V3lXa2lpQG0PQrpZGP48KEFrfsncAW/Jk9F2kEFJY087qPZZWeClgpC5qL5 p5miqHZwA/2YPa0tKFnAaWSmFN/o0WxeWueEaAaW8t31Ca/jw8Exr1btei1bOstiBJRa23NyXwSO6itccBfwAdB68BvqSMOQAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABS0lEQVRoQ+2Y4Q7DIAiE9f0fuotLXJpuekdRQNf+WrK28ePggOaU0pH+6MoP8OZqPwpvLnAKq/BxtL0053Lse1cY4B4gQpMEwB1YA3oNBAPuCjwStsIjaDfgGbAM9JbABbyltAvwTHWRyqGBWyqxAfv1fFhgZD4M9FbAJXUR9FbACLZlXNum9HIura3hUMBM/fXGRs1i4ZLSd4DRAoH67+d/z088jPGwoL3p6vwON4XrIUZCo7p/B8VT4RmpjaDdgEcq+yvtQ7k0A1sPXO4tv5lnmA8CLgqjw2uXhp5jmwMjWM ZtmXe0oJcElpjdNVtMgVllkNNKWtoDbNmHWYVH1vESCqO5WBM40xqWmI1khu7d66qwJfByk5ZW4VDAs5XutTXzGj4rJzEfRnGmf7sCnwcIzYJQFwwqKJZ9mDmQRHVG0a8NKhowExTNPS+F6MQBzBLqXQAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABLUlEQVRoQ+2ZUQ8EEQyE+f8/2sXdSURop+JhWvaZ7H6dKcPmlFJJFz35AQdX+ykcXODkSuFS5utrzhUDe+iBV5ArPA2eGtgK24ogQdMC78L2ys/AKYFPwFZwF8CnYK8EnkFTWVpTd2ZR6xz3wG2RksD7QoUAtqgcAriqjKYwN8BSmEDt/F3E2M7Dlo/vQ8ZsXqh9uIdB7UypsNSP2HnoN2rVAnSWRrYZBPwB/6sUVmE3WfpUD6/OxpQKS6uulqrG/h57mQpYgxk/Xhs/U9kN8G7SGns5BDDS961gYYA1aDpgrR +169dwwFJc1GD7uW4sLd05W9zhDhjJ0dJe/IB3KnhyjmZP67uokxay+FiAXdx4XHsebmpXlVCbt7Eu/x6O1tWgkWBCe6dl6VPr2A++5cEBgwpPnAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABOUlEQVRoQ+2YWw7DIAwE4f6HTkWlVFQCdjeOMCTONxCPB8wjp5SO9KIvB/DDbYfhhwtOYdjT8HFoG0bOxZf2LWNYha0xFXBXYAtkyysD/ijgkgQE7QZ8t112ii8NXNtSEjSyvCTwKGAWvDeGCzAKGq1D1H+0lgNY28b11hY7598sY4Rh3ZneAxmyruHtqvSZwl7go4ShZLlM6QKELLcOEqgPgv1Wb88nHgSgLpZXATOwYVidQtb2d0/puC01jLgVLXVrUWfDMpcHFDgqPqg/uhdPN6ya7dUJBryVvKnAKEhkt4 ZHY/UK2DRgJkCmyirQrobvBmbG2wKYtbw88NULw9ZFS4W2nuRcp7TyPGMF3e4Rzwq87YvHFXC0l0/bh1vBM5WWhUagv2cjzxcPaxJYyL/z9WrArNGr7T4w+r4BIREi3AAAAABJRU5ErkJggg=="],"9":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABHElEQVRoQ+2YUQ7EIAgF9f6HduNu2mwa7QPU8GrxuxqHAYvmlFJJLxo5gDe3HYY3F5zCcBjeLAJ0KV2Kri3IuSLIBw2wFrSFKIGnAJ4BewQAQbsDz4SVQLsCr4BF0PTArRSVBKqX2tTAqB4ReGs+LTCCran7KGDLZlu/Iu06boa1G+21Ftp1AljepI19iczU1VfUsZth66HzH2ZL0KiBx3LoN/uaJa7AEsuj0AHM8kwrqUeLbTrDo4cQChQ1sMVgAF+itpVhZJfyt2RJ42MOAqa7Hq6E7bWm7o2HFhpZp X7ia aVm78IgBX0csNa49n2aIqW19u6Cgq6UWwEj2O9BxtBLjxqWgJ61zQCs7aelryHN+mYDnnFo3db424A/UlKgAS/rNzkAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABHElEQVRoQ+2YUQ7EIAgF9f6HduNu2mwa7QPU8GrxuxqHAYvmlFJJLxo5gDe3HYY3F5zCcBjeLAJ0KV2Kri3IuSLIBw2wFrSFKIGnAJ4BewQAQbsDz4SVQLsCr4BF0PTArRSVBKqX2tTAqB4ReGs+LTCCran7KGDLZlu/Iu06boa1G+21Ftp1AljepI19iczU1VfUsZth66HzH2ZL0KiBx3LoN/uaJa7AEsuj0AHM8kwrqUeLbTrDo4cQChQ1sMVgAF+itpVhZJfyt2RJ42MOAqa7Hq6E7bWm7o2HFhpZpX7iaa Vm78IgBX0csNa49n2aIqW19u6Cgq6UWwEj2O9BxtBLjxqWgJ61zQCs7aelryHN+mYDnnFo3db424A/UlKgAS/rNzkAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABOklEQVRoQ+3Y0Q7DIAgFUP3/j3ZxSRdnKlyQCK3uddN5etHS5pRSSRt98gG/PO2T8MsDTidhz4RLwW8YOdes5J8wCUuwLVMKdwdroX22KNwVbIW98AjaDWyNRdEuYBTbJ6Yd97fnV7eWyKK50pyZY3nC3GI57JWWdp7HgiucQo8uXCgwmi6S8nbgelHu0KESHi1y1EBq9vEBy9tx2QguFUnKmrmWJ8ydrkjHhEBH84QFy+pm/Ov+4HIBoylboMOAV6FDgZEGgnrYR/ZySLC2dDlwiMZDi7sbd8DdVdkq4TAPD1 YlrSnnbxe3+o2HBZjDUu3p48AzWPeE28VTD/8Ikrpfu77Ea/9cCuG2A/LGxLWkLcEINlRJc+lR36PYx4Ml0N/zcaTbElLiGmSYQ2umjLVjXQ8t7aJnxn0AXNKsAfCKoH4AAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABF0lEQVRoQ+2YUQoDIQxE9f6HtriwICGa0bUw0exvW9jnG5M0OaVU0kVPDuDDbYfhwwWnMMxquBS9meRcneEPteEeZA8PgacFnoVtD2EETgn8BbaCXwc8gqYzPLIrzVlJ0Ey7AR7FdKaCuwBGqi8KTQWMvnSvLWm/l4cVwPjMsv+b/zAsK/bxhgOYbeOxGmu0f1NFusYPffG2gswMIK6AV8tk25rogC3LK9D0wLuhXQAj0C0IevcpIy1jK2F6szVS4V0Ao/c2gJXtxzGGEbvPmMk2aaHxRQcP6r+Hu2G13ZZ7w2 g7eg+TEriFmF3cWftpeuCVmLta0yITlnUIVy3irQ3nUZG2YN304dlKPIo8pWHrjn75/DrgH7KJrwGlofxFAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABO0lEQVRoQ+3Y0RLEEAwFUP7/o+3YGTtdi9yEJlnV59Y4riJiCCGFBz3xgDdP+yS8ecDBbcIptdfSGHOX5Y8LcA+HsLgDYAqegdaDgcLNwCuxBY+gTcB3YFH0duAMHyWtDr4z3et/3UOrgiXY0vGZb78GQvMsjXaaWnxm2nGZMAXOiSHoVjvuwAj2gAdHsnoA3SVMbStXm2Ra/y0YwbYGzyV4dGpCob02XIPrhLhY84TR1RUpC9F3TBet0klJUiiQKhtVpzR3hZUiR2dqM7DW9HYxpevkOFOcW0y4BEumLjpIB6 xZHkqSbH2DputiH55Fz2DfA7Bzwub18GgfHtXBnFSpey2zhKUI5JdwdWupcbx8FJi6ItpqSlNY01V65T+MQD8XApbb0go0B2uasLSA4AJ/6mPLhJEtZvU7L3EdrwHv3NjoAAAAAElFTkSuQmCC"],"10":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABZklEQVRoQ+2Z4Q6DIAyE4f0f2gWTLY7R3rUgoqt/Ne19vYJYc0ppS3905QB+uNvh8MMNTuFwy+Ft+93Icy61Gn+1cklZPBpUh7XknmSoPBbYdyyrji9gS0JrIgnWklMrGKtnB/YkZRNoIj15e6EfBVyKgYy4BHi0s7XrGvTywEfxlkJJ0NOBGdGoLXtiLAeMYN/ti6BVh9nDxvE5Vlgd2yt0lEbx4DFS2FHsyMOMR+NUYI/A3vd43YkB3Lsp9Dhi3RdQx7QOIuFwOCz0qLX9ShjUgtaYKF60dPm4kMa0 qHpWN 8LhxlKxFhGZEi09u6VRW492uBVv6hpGwMzEgj2XS7FuC4zW720+D5nxK4LVOqXpMBOQEdY7mm25xGg7ZaYlwTAbDyNa+whB95YDZs/rCKx1HxXcPdPqcfgsYAS7r23vn4cRwMxrinWZgV0CeITbLOwHmK3irOfQpmYBrDXHD/FZLl6V5wU73yEQ2i6+3AAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABQ0lEQVRoQ+2ZWQ7DIAxE4f6HpqJSJUIBjxelhE6+Aft5wHYgp5RK+qMvE/hwtanw4QInKry7wqVci0rOVTP8C1G4d6I1r3Wod321dj8WsWUGRh1BnBjpg64/mruyaQLWOENg4LhpAjpbbhboLRWOAK6BGEFvB4zAVhBk3Aj6UcCzbaqpElsBaxxvz65mnglYUyvRLK1xWlPGevvHANcgzILWQhMYKJNfQ7zbcaXOrLxYtzUVpsJABLilmyDdVZaYpSdBZ9ICjizLEpMWk5Z8ULy7BOmj311bxNuS19lPOKzraO ZtBWzpqaWbj7DfQ8mQ5c5YAu5/JBAf3MCIkdWJlTov7/qt7ZBLPK9DEjCispwCxzeWpqR1B7AXOvTlgcDI/jI0IkipGpmWjkxIWVIym4ejzcUyaUY0HmaCH0x8lMIR8XkBgDweEGeULMEAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABZElEQVRoQ+1Y0Q6EIAyD//9oL15iogRoOxfdcfNZtnbtgFFLKVv5o68m4cXVToUXF7ikwqnwYhUIa+lt464Hte4U+I8mjACoiUcQUZ7ROjb/lLCSnE3oTbSNh3AMCStk96Qo0cx0ai5k4BmW1wl7kz2KMSKdhI8KqZW3WJrN0ca2rvu23mhaYoMiC93pXVREhLG3/tVjyQL4XEDLeprwnmiWAKnRKm0B23OLGickYc/itbFeIayqgs5dxXnLE24vRUnYeowoffekpVNh5ZlW2RysTrEMIopjsoetyig9/OQlJs Q5jAgrtlbsPB0e1Gucp8IhCKuVRLcjD5UtmOhNCwVXVFFm7pFzrHggYSaw+pCmjHhtIRU89DysBJ1Zl+lrr1xs0bsKe4FgCDO9zOwH53/kV8unCXuT/gnCHqQZR4WwtLqJ9SzOkJUvHmov3f0ftRZL8tLfyrR0l0CE9fAcjgDSE8MHWt4MEKvyv/0AAAAASUVORK5CYII="],"11":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABB0lEQVRoQ+1a7Q7EEBDk/R/aRdJLXKtmrdH0GH+rZueDIo0hhBQ2alGEF3dbDi9ucJDDcngxBRRpj6EptfcuMWZdxxoLY8hhVMSXopewdfyMY8VwEe4ppKeYMgOzMETYMtNmqS+HLeoffTSHb8RyzeHzWCjiVvXPkS7fY2FQCOdCWwV5CNcMYmCIcMc68dOVoT7CZmDIYaTy3XOG+gibgSGHkcpy+FCAETckNgNDkUYqK9KK9DUD220tvbceMw4pjyxaDMLotGTFGCZsKaR0qjfeveMj4i7CniJqq3uL PAOjN r4IW77DDPVR9BgYcjhf2Ht+eWCo/1cOW2L/1j4uh99KxlLXdoQ/ACrTAU3G1UYAAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABEUlEQVRoQ+1Yyw7DIAyD//9oJg6oCAGJQ8po615XzfEjRjSGEFL40BNJ+OVu0+GXGxzoMB0eKJDS+DSLMQfH7/HEgiI9A67peRDWYmVcBE8kjAAX0sgAtVAWLBIWNokOtwJZYsZIKwvbIi532GOH64hqXLBGOs+a//9OPLG0eoJJpFcIWzoEwTuecHF9llQSnqhDhzUnyM4dZqQ7jnCHucOXAiwtllZHAbZ0IwrSmrsTxR3erfhuPNhhaX9XP+T9/bZU7qdaoiu3Gg8MSXDRYcsQpbRasaQys2CNBB5hTQl7Dq D59lTj5YFX8E2ENTcVTelIMSu/f5owImTv3cc5TMKgAmaHQZzjXxePpeMZgAP+AEol9wHx8gSSAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA/UlEQVRoQ+2Z2wqEMAxE2///6C7CLoi0zSTNStHj614mc8lYtJZSWnnRVSH8cLdx+OEGFxz2OtzauORrPfTMuzKwlhyeDXDQzCScheUibIFevVwh/C8sibAX/EfcSziK40kThHsVE1Ueh43CjgpLpCfCssPqMUGJn3eHR9iZWJLD0UEgrMbn8j0c7ginpolIe1JnRU1V3cK0cNLvw5TWVwFLeRy2sjv43BKWSK8eLdlhdrifAUqL0tIU2KKlM4ewaGdihc7SygDRJ5dn8h4c9V4sEfYCzxybFdkdOBDOfEzb+y 8cPqlCpK36np2ZB28upR1ewN3upxDezpLkgT76buIB9iq5HQAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6UlEQVRoQ+2aQQ7FIAhE8f6H9qfJXxhThQJtqn3unTIMDGpaRKTKh1aB8OZqo/DmAgsKo3AwA7WeT71SjuLyLy/uLSU9Cqald5WwBfPA13DTCWcF1mufhbsEYSvZbRSG8MTrtuhhFH6TwlZ31UpvNqFnimu46S4N4RtOWijclBUl3fUYPey/v5zv9N5qcOkmA5gWpjVuCEwL0wpmAJf+J1A7ETGWVhhL2sXdq/Lr5rBGtC9XC/GrmKMHvdSx5AnK8lYdwe2TCeHIFIooMXtTjuCicOYvDxElllQ40g5P7U01ra eCjnznc4R/khvcAQow/NUAAAAASUVORK5CYII="],"12":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABLElEQVRoQ+2Y4Q7DIAiE9f0fuotLlixO4U7RMkt/t3AfB2rNKaUrPejJAXy42+Hw4QancDgcPqwCrlv6urAjQs4FA3toYEQEI6CWicSX0LTcFDAqRkvaEozGRnyU8kPArJi7gUtRehoC2KLdPDjcc9m1w73CoSPW+t4dMNMdGvgwMLt1MKKRVbf3zjbgIkBKFsAzNgrfhsNVccxm+O6W1pydPniwe/PKGUZgjwGehX0XYvTWcucqbQH66VLXwCio1ML1OLoFXgHrsqVXgbps6dWw7hxGgWe2PTczvAN2 2GFEH OsCEpNZjXtHcMphVNR3MgR8VdwWtAo8IqaZSLg7tsrxs+c2cgYwe7uB/upKrR0Oo1VU3hv6H7aq/t84bFRsN2HURcuNUiMhjwN+AUXm2QFHHzmSAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABLElEQVRoQ+2Y4Q7DIAiE9f0fuotLlixO4U7RMkt/t3AfB2rNKaUrPejJAXy42+Hw4QancDgcPqwCrlv6urAjQs4FA3toYEQEI6CWicSX0LTcFDAqRkvaEozGRnyU8kPArJi7gUtRehoC2KLdPDjcc9m1w73CoSPW+t4dMNMdGvgwMLt1MKKRVbf3zjbgIkBKFsAzNgrfhsNVccxm+O6W1pydPniwe/PKGUZgjwGehX0XYvTWcucqbQH66VLXwCio1ML1OLoFXgHrsqVXgbps6dWw7hxGgWe2PTczvAN22GFEHO sCEpNZjXtHcMphVNR3MgR8VdwWtAo8IqaZSLg7tsrxs+c2cgYwe7uB/upKrR0Oo1VU3hv6H7aq/t84bFRsN2HURcuNUiMhjwN+AUXm2QFHHzmSAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABP0lEQVRoQ+2Z2w7CMAxD2///6KEhDaFeFtvLWFq6V1CdE6duGTmltKU/evICntzt5fDkBqflsOXwttWhnvPeN7+npdFbndWGHbaKYIVbAJaGB/QpMFOACsxoWDOE1FABqwUgYmXBqtYV8AWsdj2Sw/sE9OoJ63CrYMaM8MDMhCDgoYEZ2COwLGgYuJeAqoCVqOrnaj2hLh4M/AIuujXVSFvuUsfSCHvYAj4LwaH2sAV6mDU8sAfopxnoSzxLVDlLkVS2dBFXv3XCjjQKOgUwCqtMVSiH7wQNt4dR2LMzFsmEEA 6jsMoIl014HPiXsO/pePJYQmGvjvEtx5JSVEhgpigWml2bXb8VYm7vtJqLG/9IKMBIElO/ljyLsFLVU6tK406zl8OeXV8OF3Pn2Vx5pNFQGPV78MVjVED5ajkL8AtiM+sBgjIMCAAAAABJRU5ErkJggg=="],"13":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABLUlEQVRoQ+2Y4Q7DIAiE9f0f2sUlJl1jvQOZc0h/q/BxINScUirpoC8HsHO1Q2HnAqdQOBR2FoFtU7oUfjzIuWJwnwqYcUbiRHOVOXeExdgUAUscYoxfnZecPQNNAWuc+RVwDcbItkvgEXQA9+pjdUoz5YB8ejpjG4W5pvK5agQ9BXx3BkUXXRwaOGnmmQJX4wiaSctZ8GUKB3BHqm8rrFH3XWraJ55VKY3sXGPNBNkNMAPrSuHjgNlW6Cal2VreHvipV6PLzOXggeaBHvTfKsy8krgElqrsWuHezR3A 6A8G3 Y69/cxQ0M5l1qI0HrUoSmENpBTcygbqxwEsfVlAJYAizrQXiY22dmrwsEq3UX1a2UAztbuURpceBaxJKYs9jOoI8O7H1sAWQTse+AWe2dwBNVv4CwAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABTUlEQVRoQ+2Y4RLCIAyD4f0fGm/e4c05mqRMR5H9Fdp8pFAkp5RK+qMvL+DJ3V4OT25wWg7f6XApWsPIefNL+yiHkRBP4r1MFN9CUnObwKwQNWkFYOMzHrIa3oC9AthkR+HefD2OL2CmfI5jRnJ402bpmc7hEMBKhTD7fliHPdtnm4OgZeD9BBQclZAXypqHNNHAZ0lQ8OmAe0vo1w6j82CIq6WyKFbFIdhnNTIvHqismUQKVGvsFTqGBUZwdVHUxQ4NrMIOXdLLYeMQUJwOXdJna4DghwX2ntToIhQOuPciFB K4BzosMIJu7eWwwKhtuYFRYO+Np+eqyWiigJlAilDUIlr5WvMUfaGA94tahSuwVmu65BGv5brXYaWK1NxTAtNPPGrZICfucBjlnMphBPvx9zCqwwzoq30yTzyodL/xu9qyWA3UTYsNFmHcA5nn9AFLWZGcAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABMUlEQVRoQ+2Z0Q7DIAhF9f8/uotLmhqnwC3KLKWvc8LhClKaU0pHetGTA9i52qGwc4FTKLy7wsfxe6nkXHSTPdMV7jl0uoI4dv6H2q+HyNmYAix1inOmBpDuiUKrgRHHrIBLEEa23AKPoANYVuuuVRZHmkoFtEhuqzASeAQ6gJHI9tYi0dba4u7qXiqoFW6dDuAqIsg9jKiPtJsuFaYC+zhg7hrkTlEAI7nzjyodCjdRf92Rpt6Uvr/NHtNa38OovccDU92W204LgXajcIGWdFwBvPs9TPk3KmB1LrtQGGlGpg BzBtFRap2PXCMxyt3RLFwNfAdWMpjX7FsHuA1YAKNFS6PE3Wmk1McljceuwFt8eWiVWaWw6cRDetzQddxJklTzJW9LKIj1enWVtnZYa+8DSeroAbAnHr0AAAAASUVORK5CYII="],"14":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABMElEQVRoQ+2XwQ7EIAhE9f8/2sZDE2OqM7CYFaXXZWUeg5TmlFJJFz05gA93Oxw+3OAUDofDh1UgWnpkaCl4P8m51m/dw2io2Wc6oMNsEpTIogysFjUwm+CFWemwRIt7YAks6rRpS1sm0ra0VINrYA1sAHetBad0G48qbjm0UK7ZFVEPrf5QJMIKGOVB88AV8Ai2hUAFcQM8A+khJLFtR2x1hxl3X/HugSWwFdo1sBTWNbAG1i2wti2PA2be59pi/W1KawUjd3/apVduWmh5QNsU+3vfLVs6zMKwcS10 AM+qx rQhM3CYe8i6x8SJHWZA+8QIXHMmA/cVQwFbCRqBW53PFGELYEboKAYVS/V5iA5lBaPWZs+RvCIDuKnW8LV0ncPaVtv9f6LFY3cYRt91wA+1eOsBRrWvBQAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABPklEQVRoQ+2Z0Q6DIAxF4f8/2sUlLmqoPQVGCtZnbO/pLYXNnFLa0oueHMCLux0OL25wCodf6/C2PZ9WOe/NMe7R9OxKiKZLS5OgByIJ3qscVBfR9AWmAc8AJHgPYIs2osk1sAXW1NLWwDR4i8P/0uTW4dcA14BaBqkrh1tg6Tb7AZ8nHElMJqJ1D5O8TzGJJvFqqSUnwS3AWj4Si2hyD3xAkIJMAyzB3AE0aPfATwAl8QF829iuHba6u7NN63AN7JLAWktO6TCdyKVzdyrg2jY+gy8DTO/BGjCJM+ymRcRKgu m75FeTO2ByZ6ZrSkMwgI/qkTbSjhHLwKGuWdaJDhM4mkgqQs8cLVqq//GQkgYwteO2rrUjpMIPc7iS+/IaKYI2V5YC1mC/53ztpxbrHh7hcAAXqhwfxHu0nucYH+FFBhDWrHbsAAAAAElFTkSuQmCC"],"15":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABOUlEQVRoQ+2Z4Q6DMAiE2/d/aBdNTKZB77hW1zL8Owd8d4CN1lLKUv7oqgkc3O10OLjBJR1Oh4MpkC3NGLos+KxS66ql/2JiM1Gv8rsc9hQzNbAHdFdfAVbyXLnd5LBSSAITg6cIG95hpXO+RaGWlqK8UthdHiWe5T4FfP4jI4BS4LDAqwAIOoEbl5YiYLeWTocNKRVH0Jh4H0FTO0xMxHYLElra0r9oaRYYQQ8LfHbK2+5NZ2lLXVQAai2PY0r+K6eHctgrgiL61MBol1hdFhrYausEZudImR82tuc+ bx1TO +yF3Vrc+/UQJTGPc8QbzDUu+yhja5CXFpsAteIdUK8ch7cbhtCUw72KeRO46aQ1G/CdsOEcRnsgDDAC3WebAkbL6InfmTFiIQ+LzPtYegLuzZjDOvyUCB8HW9kBQMEcpgAAAABJRU5ErkJggg=="],"16":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABXElEQVRoQ+2YUQ7DIAxD4f6H7sQkJIRo7ISAgLLfrrEfDqFtDCE84UO/eIEPT/smfHjA4SZ8Ez5sBZZv6efhHxNiTDjyTwWMxBlBZChfR1qozpsXCpgV9wBmtYYAa8V7gbV6ErQpYa2BHmCt1tYJs7DMguZayybsCYtST9fFocWayUJMArUppGGpKe5t6fUwmSkFR5gbUdMM3LpRMmhJw7seamvqHC6LeBqcnS7cw6MTvsDVCmvmBzs4l25ptB/frkuz5EhgKe0LjNpo5pRG+xINvf9Urt6Rl06YOdcR 9HHAK UUN9PYJbwWMzDItjWrU+9g14daQmDEEh7U0KuwNzNbTnBxUwgxoneSIdtQ+26uPJQtoyxSCZ3RaNSz3uX7xsDzb5nsY82geMF22DDAzbTXAUz7i9STsmbT5bcmrzdAerheqRxdpUVNa00oj/osWAEGWnrYA9lzEzwH/ANrX+gFv13vtAAAAAElFTkSuQmCC"],"17":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABIklEQVRoQ+2YUQ6EIAxE4f6HdsMmJoYoM0OXlUL9NnYerxUxp5SOtNGVA3hx22F4ccEpDIfhxVYgWpoVehzt75Wcy1pyF3oW95Tnu65ZJMNKMPfACmxZ6wBu9KW6mGqLd7W0GmoWw3UOeoZHAivGrDncAZ+Lw4DfdRkNXFtABZWWVgy/BlwKt6DfBn6q3204gKu+HGnYMk4uDW8FjGDRV547wwgYjZIrYCvs177lN+2/t6WtgBEsmt1zE3FjGAGj2XUFjGBZu25mGAGzdl0AI1jFrgn410GeTkyojmK3 CxgFu AuuhrIeAVvHTfot3QNqhUc1exZyWmAEq86uvC0xAZg/F6wVVI99Tp3JreGlgEfZ7XpLM2078z10S88MoWTbDvgDpSDQAfK61qoAAAAASUVORK5CYII="],"18":[],"19":[],"20":[],"-20":[],"-19":[],"-18":[],"-17":[],"-16":[],"-15":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA+ElEQVRoQ+2Z0Q7DIAhF9f8/2oUHG+bEghnV4u3j0kYP5xbMmlNKJR10ZQAHtw3DwQUnGIbhYBVApIMJ/cGBYRgOVgFEOphQNC1EGpEOVgFEOphQdGlEemWkS+n/Y5wzeelf0jP8bv78NoZHG5eANbAEDuCVMa5r/8PwKPp1nW0izYvewmsjfRyw1Ki+ft/x29KsYenV3LJpzUaaYO669SPAlk20ZrSGLb O5Qrs 1rZ XAVAi paG 7AvUU 1TW W0We34 7BX b3bB2c 5o5 fM1Qds S8S 1C7/iu B+T HRAvxI 0/I wPAPcH kZc32Er9Oz9ZJuPp9GJKwSwpVDHAX8AMpeOAfpKQvMAAAAASUVORK5CYII="],"-14":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA3klEQVRoQ+2YQQ7DIBADl/8/mopDJUTorkkEBce5FlDH4yVVk5lle9GTBExuW4bJBZsMyzBZAqo0mdALjgzLMFkCqjSZUF1aqrQqTZaAKk0mVLe0Kv2vSufc/7c4peIEe5AztjD864sWTBQYPYMC2INtQxMwNi3zVrW2okpHdrc0XMc3Atxb2wugDm2LSt8B9oLxPjsSOGrBcuBorry5jGBKG0bsLpnh1cDIFfoNeUqlXweMJO5dVL399RhEgXr7pxieDeydf8RrCTEW/QBBX21bGB5txJP1An6S3gl 7P9Z4k QHVSEwZAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAABAUlEQVRoQ+2Z4Q6DMAiE2/d/6C4uMamdFBBSKjv/mlI+7jztVksprfzRVQGcXG0onFzgAoWhcLIJwNLJBP3BgcJQONkEYOlkgiK0YGlYOtkEYOlkgiKlwy3d2vVH01qPlvTXWOeocFcrDPiuwRNTC03V2gZ4BkspQ2muHVyIwl7AT+oAWB8XthXSsBl34dTdLrROgCfAVLJLEj/E0r1akiZn6vZJLKm1HTCX0jOoZcDc8zR7r2oszQFx97/D9Pi7dAUwt8csOvuBm4EljXgoLNmHgnYFtryUNJ+ErwaWNj86Q7 puFCFcYWnj1kPEaw4PXqembYAtz711rTmlrQ2sXv8B5SidASOnzrMAAAAASUVORK5CYII="],"-13":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA6ElEQVRoQ+2Y3Q6FIAyDx/s/NCdcnGThZ0yFMGu9FbTdVzc1iUiWDx2JhsFpkzA4YCFhEgarACMNBrSxQ8IkDFYBRhoMKJsWI81Ig1WAkQYDyi4NEemc2x+vKRVr7RHKcE94kTwSP1qvbdZ7wxi2xD8xXBeMhk916TuER1rra+mEhCGsxVuCPUA+Ydjb8GAIe0cTtOHeSNtmeDYjR6OmiHzlM3zSsFW0bYR7N7XegFZ26WOGPSPkv2aWiPp59KzvFXgr4dWGtekrhkO+eHgNaPF39oQhfCUNs7WlEK/ 4PJwZW XEekrBVmB+E2IsBfl52wwAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA8ElEQVRoQ+2Z4Q7DIAiE9f0f2sUlTRyTCtREdrv+FuPHHWDbWkpp5Y+eSmBwtakwuMCFClNhsAzQ0mCCfuFQYSoMlgFaGkxQNi1ampYGywAtDSYou3QaS7f2+fG01n40/ZHr5Uot/ijw3aHvgFewF/xsD2jgDi6hfxpYwsyUhwD21HYq4PHg3qalQY/7pKvhXcBaE4ME9sC+m1iWn2lRSx8DtsxGz2xdXTyucvDO8m0KnwKWzWvlFAKfeFvy1GFfq9ndss82hSOJspSBvB5aY7T7NIEjSkVjrGqNFrbGzF4cUs 3hXUlbjbOjlo5CPol7ARBFmgG2HnOgAAAAAElFTkSuQmCC"],"-12":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA60lEQVRoQ+2Z0Q7CIAxFy/9/NAYjWd0GFLGmXu6emenpuWvNlkQky0ZXIjC4bRoGFyw0TMNgHWCkwYRecGiYhsE6wEiDCeXQYqQZabAOMNJgQjmloSKd8/ECNqWCdr1CAeuCdamt4lvnz5j6/jDAveIJ/FJoNVyO16b9veE7+3eNCAdcn7tesdaVuT1wyKH1DcOWKR/mGV4BnpnwbsCjCTqzalpnS5MsVt92utfn0l8Az8I+15MXcK/7ei+eJ691Sn8C6w5sXSOj5tTf0dEeJaj199LVMIE7HbAYgzI 8k4aVs 2EivQIxc+92wA/y+IsBRzl9zAAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA+UlEQVRoQ+2ZwRKDIAxEw/9/NB06pUMRTMBMwXW9eDEOL2+J2gYRifKgIxAY3DYNgwsWGqZhsA4w0mBCDzg0TMNgHWCkwYRyaDHSjDRYBxhpMKGc0ttEOsbfH09DSEvrH/X19ZW9+qXAZ4vuLVgDLcFb94AGTvA19K2BE0wyns+tDQADbI38VsDZSGtfakOrN8604bc00t7AlsZBAPcm93ZT2sPw6KPNzbD2fDzbk5Yo1nt2FDTX3xJ4JMKHNzCv/4f/aXgmEe6Gr3xljQDMRnkLYC0V30UWHxLWmlbt+1XTK9 Izhq2LLweetYbAnw4sNTyTiqs1jwN+AdZFmgHyB1aHAAAAAElFTkSuQmCC"],"-11":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAyklEQVRoQ+2a4QqAIAyE5/s/tGEQWJnloDjX51852e1uc4jJzLL9aCUIB1cbhYMLbCiMwsEygKWDCXqig8IoHCwDWDqYoDQtLI2lg2UASwcTlC4tZ+mc94+oKZUQ+2sEI0P4GPRGsUf4ClOwVzgJwp7AexgIVxWBwncN4u39kQa0xdKyt3QN10mEsONakm9aUyt8d130sl/2prM0hBttfWR68oyW09SwZ7xslYE84SdlcCThwaxnKHx58ATvwUD47bFR4XwJS3+ZiAUWmZEBsZnzYAAAAABJRU5ErkJ ggg==" ,"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAvklEQVRoQ+2YwQ7AEBAF1/9/tMZBIkX1HQRrnJ+mb2do0mBm0S5agcLOaUPYOWCDMISdTQClnQGt6kAYws4mgNLOgHJpoTRKO5sASjsDyi2N0jsoHWP7z3EIiU+9lPx2hHsvn2q2Cqt5Cq9WWiWm5rcjXA78XaZ3hvOeP3kKr1YawsUEjlD661LpfWqUM6kaMf0MX1c4EVA/Hb09RyitXoIjI/Lzcnk1P11pCg8moBJT89sRVo1Q8xRWJ3Za/gGfaIUBgQrr8gAAAABJRU5ErkJggg=="],"-10":["data:im age/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA80lEQVRoQ+2YWQ7EIAxDw/0PzagjIVVsNlAp04z5LUFxnsPSZGbZ/mgkCQ5OW4SDAzYRFuFgFZClgwFt5IiwCAergCwdDKg2LVlalg5WAVk6GFDt0q6Wzrn9YZrSlRIevdgSNVvDTfAoYUbwTOy9VL21XATv0mGFzkRLMO6e8xlPEq5ti/YFF8KlZCi5e2nZuWieBJ8bll8B0RDhqpa9YwcV8djSzFExOltRcj9JWII7LRyKML9FtTNXr5eoBdD3K4PjHt4RzLTBN7nqIcHGvepqiS7/K6Jf8XhAgme 3NCbWx dI7bTCKKcSZZ6VbDz8peHWtD/1/rwFcJWm1AAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA7UlEQVRoQ+2Y2xKEIAxDy/9/NDs8MIMsLfWyQrPxGbUniaWYRCTLH12JwOBu02Fwg4UO02EwBRhpMEO/cOgwHQZTgJEGM5RNi5FmpMEUYKTBDGWXhoh0zscfrykVrPG1BXBfcC3VKrys0e5rUftnLAe2iraAPbAj4UICn4Et0K1wEMB9EkaC1DXLgdvvzdt8POu0NeGALfc84hF45aR1Jap9U6r1vxZpTwfVthsCKxPTFWF+2qVnLt9xWJuw2mduvS3NxBlNS957wk1a1kx8BjrMpGUBhz08PLkNFtdnJ6ytBo 8n4bc+D78BWt/xATAGowFWl/NkAAAAAElFTkSuQmCC"],"-9":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA2ElEQVRoQ+2awQ6EIAxEy/9/NBtMTAhb7Jg9rDMOVzHx8YZSjS0ierxoNAOL27ZhccFhwzYstgKOtJjQLxwbtmGxFXCkxYS6aDnSjrTYCjjSYkJdpSkj3fv1h9bWBlY+6IAr2BkzA6cCvgM7wCWBZ6hsQVZoGsMIzLC6zqMFRmCyOWu0aQwjMMgcemCkUZpjTQW8M1hBPwIYOWJ2DQRy7+48/pth5KGvOqad1aqaG7jaD0++Xtk9jii2PwCQrXBKoW8t71bp1wBLvR7ONaTqm7N6Q7eHfy2aH6TfcAED nK6cA AAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxklEQVRoQ+2aQQ7AIAgE4f+PtvFgYi1I25Ms6w+GWRCbqog0KXSUwOC2aRhcsNAwDYNVgJEGE/rAoWEaBqsAIw0mlEOLkWakwSrASIMJ5ZSGiHRr9w+vqh3LPqmBV1ALcYVPC/wGdhRghk4JbMHOULuIQwBbPetBEzjDPRxFujNAG34jacQ+ZaQtgxH0ccDRNeMtE150j4/0X2DPbGrg3apoAe+GWokeTr9pfRlapXZpqxXSRnrt3blvYZ+H0d1rPher/cVzAZA6cAF4F+hTAAAAAElFTkSuQmCC","data:im age/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA0ElEQVRoQ+2aQQrAIAwEk/8/2mIhVGJUvDWb9VLoQZjMGmKpikiTQksJDG6bhsEFCw3TMFgFGGkwoRMODdMwWAUYaTChbFqMNCMNVgFGGkwodpdu7fseqdrDOy+ISI+gHtGDpwfewRr8CJ0aOILtcKv3vQBQwD6+0ZkuA/zaVa1jGBLYoPpzdY6hIn0amtJHemVyBf5b4JtBwuCijuz3gQKOrJYCjmDTDx52hncDhx8vU3fpm6ZlRSkBDHN5iDr02LyiO3F6w6dhY7ofV/uL5wE3r3kB3mwiqwAAAABJRU5Erk Jggg=="],"-8":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA20lEQVRoQ+2aMRLDIAwEpf8/Go8LPDKWAHXofLSOi9UeB8lERaTJj5YSGNw2DYMLFhqmYbAJMNJgQj84NEzDYBNgpMGEsrQYaUYabAKMNJhQtjREpFt7//CqemP5qzTwCOohjvBlgXdg+wAsNAywhZpFvCSwZ3eMbgRdEviO6qqo7HPISNv9ChfpDrdTXDAt7cU6PHvNuXzMHl7Z2i2laBD9/ZLAq8KalVoJ4IzdaH8fZzjzLS2Kf4eandPHGM4AZwprvF6WBc5AQ1w8bCJ2rpqPaf6pJbuZin3+AgQB eQFfG 0BNAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxElEQVRoQ+2YSwrAIAxE4/0PbXEhSNT6KRRnHLetwvNNEtpgZtEuWkHA5LZlmFywybAMk92AIk0mtMKRYRkmuwFFmkyompYirUiT3YAiTSZUXRo20jG+/2wNIaHVCxJ4BFtienA44BXYBE4H7IFaF1K+A2/4OmAfW28YPtIJcKWOrwJujSa4GoY2PBPNUVMqn/fOO6ZLrwKPRk7PPjXwCBqqhuEN73yKzpSBP/eYSP8BTDGHZ0cTzRzeSUbeA9W0voDmvQ8a/nYB0EHCAwAAAABJRU5ErkJggg==","data:im age/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA0ElEQVRoQ+2aQQrAIAwE4/8fbbElIGok0kuybo8FD5NZVyktIlLloqcQGNw2DYMLFhqmYbAJMNJgQiccGqZhsAkw0mBCWVqMNCMNNgFGGkwofkvX+n2TLKWFd35gIq2gS8gOHgJ4B6sDUOPpgVewDW58Dwk87tsemsBZjyMruo0H0vAIxpYezuT0Le0x3F9EQgJ7LxHWPl0NIXRLe4F3hWVBpzYMA+w9Iq1blq5fDSSk4T/A1trQe9gL7G3o8C19AuyB7u/YqSN9OpjX9G1/8TxG/XwByR6q+wAAAABJRU5Erk Jggg=="],"-7":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwUlEQVRoQ+2aSw6AIAxE2/sfGsOCxMjH0g2ZYVwaNXl900KIbmbFLrpcwOS2ZZhcsMmwDJNVQJEmE9rhyLAMk1VAkSYTqqGlSCvSZBVQpMmEakrDRbqU3CGre0U1vBMPAQeGTrMLaXjEV61XqJl9OuB3EUbQtMB/sDSRboavAo7AUhmGAY6sq++hM5vS3/uzd47vtAQ8ULhrePX8ccOBjdLykWjvto9AA0d2Vl1vI//ysGsXelnKwEIDZ3sfuocz0A/p1GQBrNz5YwAAAABJRU5ErkJggg==","data: image /png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAArElEQVRoQ+2ZMQ7AIAzEkv8/mooBCVEBaadwmJnF5yOo1M2s2EXLARa3jWFxwYZhDIslQKXFhL5wMIxhsQSotJhQhhaVptJiCVBpMaFM6eMrXUr80dXdz3/xAHgxhKQMV5i2ZtYlgGdCR+gWyPFDC+D672iY3H3dJQ0D3A20tIZ392tf0/4cr+zWfQBn+Xi4zvCf4Hd1Tl1pgDcJROxKGb4OOHoE0l5LUYCv+x7Gr2QB3XTKMwAAAABJRU5ErkJggg==","data:image/png;base64,iVBORw0KGgoAAAANS UhEUgAAADwAAAAoCAYAAACiu5n/AAAAqElEQVRoQ+2YQQ7AIAgE4f+PtunBpE1Ni/Uiy3jWwzALJriZNSt0HGBx2xgWF2wYxrBYBYi0mNAHDoYxLFYBIi0mlKFFpIm0WAWItJhQpnTKSLc2v2h1P1Et58YD4MDgKWW4w6aN9JvQUdwBDrRAiitfduUiXQo4AruN4ci/eh08o/4qBRyFlTGcDnjlC5iB3cYwwMEKzNpNb7gccDAIt2spFwB/QPubA6BYYQHbsL/DAAAAAElFTkSuQmCC"],"-6":["data:image/png;base64,iVBORw0KGgoAAAANSU hEUgAAADwAAAAoCAYAAACiu5n/AAAA3klEQVRoQ+2ZUQ6AIAxDx/0PjZmRBLAC+sVq+SMYk7d2ZdFkZtl+tJKAydWWwuQCmxSWwmQVkKXJBL3hSGEpTFYBWZpMUIWWLC1Lk1VAliYTVClNZemc2w+wKTleu8ID95CoJWvw0MArsF4ACuAn2BquPBMeGMGifoX2jvjnQcBXn64UImRorYZVsTRlD88mxAK9jcIz1VD61pB9aD0NIRTAKKFDA8/U64cL328PPOvB/nyUyKOzbSz9FhipOHrHdqH1BXgVOvy1hIrjNnYwND83aR5xtPzqhjPc/gZ8 AMZfd gEFyRlSAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAzUlEQVRoQ+2ZQQ6AIAwEy/8fjcHESLTYihLsulzlMp1tIZJEJMuPViIwuG0aBhcsNEzDYBVgpMGEnnBomIbBKsBIgwnl0GKkGWmwCjDSYEI5pUNHOmf7h2tKBXFfYYE9sAUTAtgLCwHcgj2abA3fcJHWgL2wq/FILw9PYWGA78Q8vGHPRamOPIE9FXtrj+d4qe14etiK91TDI4CLjKvChALWYLQj6bPAPa3RE+uwQ6sVV6twoYE3OE//Q9yla5sWtNbfU4eWFcUR338HvABIunABn0lcHwAAAABJRU5ErkJggg ==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAzklEQVRoQ+2ZSw6AIBBDh/sfGsPCTxCYkZhoS91iTN680ogmM8u20JUETG5bhskFmwzLMNkEFGkyoTccGZZhsgko0mRCVVqKtCJNNgFFmkyoWho+0jmPP7qmVBDPCxbYA90RKYCjsAUaHrgHW4P1yhcu0jVwFPSIONKfh5bdZYGjw4CK9JOyomjpGeC6qT81HAG47tFIbL176ICL0RE0FHALptXSvwWeOZl5kfXWPzX8FrD3nGsK4IB7e7T7KslyWoqAt/Y3pGEvwqP15YA3SN5wAW7f2BoAAAAASUVORK5CYI I=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAx0lEQVRoQ+2YQQ6AIAwEy/8fjUFDUqCITTzAdrkqJtPZFkMSkSyBViIwuG0aBhcsNEzDYBVgpMGEDjg0TMNgFWCkwYRyaDHSjDRYBRhpMKExpnTOz71kSiXA7YKKdAUdIBU4BPAMVINX2wQ+bWj1dq2+bUyffBFvRTkU8Ar2ntxohq2W1IUIAazP5DDAFXpL4LdzVcdzNaGt5wTe4Rz+y3Bh0d8q6djSsKfob7E+JtIe4N7ibC//pb1V3e39r31/fA97Cx8O+ALAJ3ABK7b02gAAAABJRU5ErkJggg==","dat a:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA00lEQVRoQ+2YQQ6AIAwE2/8/GoOJCWK1FU2k63JVCdNZKqoiUuRHQwkMbpuGwQULDdMwWAUYaTChBxwapmGwCjDSYELZtBhpRhqsAow0mFB2aYhIl2L/eFWtePuRGvgMtEXsoVMCR0A3aFhgK75WA05n2LIbha0FSA98BxYCeIVQlaj59IYjB6U2BQSOVOzNe7xXTL9HI9Ht75nK8FNgq2ldFeXzSP8OeGR7XEW2zjd1pN8A9uaYag97iz277m0FqLP0BuNBw30ejqTj8y49sugnzyx9d3ABPHdWTgAAAABJRU 5ErkJggg=="],"-5":["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAtElEQVRoQ+2Y0QqAIBAEz///aEMiEPPwhAJdx+cS5mZdo2Rm2Q5aCWBx2xgWF2wYxrDYBIi0mNAXDoYxLDYBIi0mlNIi0kRabAJEWkwoLU2kd4p0zrE/zCkVr/fa2jDATjxlDddg3tGUivRxwLVVD17KsBtjWnqRy3d0zUTOaEHp7fO8u1SkvwLuQUsDb2N45mSN0tDutaThv4AlvrSihtuiW6q0Zgy3zz4DGDW5DHB0WMcBX915XgFHb3QgAAAAAElFTkSuQmCC","data:image/png;base64,iVB ORw0K GgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAvUlEQVRoQ+2YUQqAMAxD2/sfetIvZ12hG8Jcmn2r8JI0K6qINCl0lMDgbtNhcIOFDtNhMAUYaTBDXzh0mA6DKcBIgxnK0mKkGWkwBRhpMEPZ0sdGurXcz1ZVQ7wPgU+ZYTosIhZfLwRspD1YlFSYGS4H/Ghi18zHt3S2sAwUYoZ74FFR+fntobfPcMat7Hwa6Oh7BN65bJRzeEVsE2kU80i8X0V6FXjmvVLAcNdSuEIGy8f2a2kmml88Ww74AltCagHHFBh4AAAAAElFTkSuQmCC","data:image/png;base 64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwUlEQVRoQ+2Y0QqAIBAE7/7/ow0jQ05RDnqQaXuuYG7W1XIzK/ajywUMty3DcMEmwzIMm4AiDRM64MiwDMMmoEjDhKq0FGlFGjYBRRomVC2NiHQp+x+v7hXVGH88BDwpIrzhCljNN9A2A9wajoBRNg74LqanoGZbLBK4B8VHemq1M443/JbV6fvwam/dFVODjO+ozx1rWMDd4kQazny1xQPGLB34k9Zw4Di9tLKGV/f3S+DY0voKGHnwyAwHYTgDfAHS6GcB09ok/wAAAABJRU5ErkJggg==","data:image/ png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAt0lEQVRoQ+2awQ6AIAxDt///aAx6QQQDXoTucdekfR1djG5myQIdR7A4bQiLAzYIQ1jMASItBvQhB8IQFnOASIsB5dIi0kRazAEiLQaUW3rbSKc0/rHVPcu8DoJ3mWEId0iVcZaKdC2sl1SZGQ4nuCT6Jl6GcDfCRSVJzfBbuyzXwyMVMzqjrXch+O9lIxzhWcOzQa2I94xbLtJfBM88E0qwxGo5MvNn51YdvHUPz0T6toVF+4vnAEg0ZAF8RU0CAAAAAElFTkSuQmCC"],"-4":["data:image/png;base6 4,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAtUlEQVRoQ+2Z0QqAIAxFt///aMMiCNNUenHX42shnp27IeVmlmyj5QCL28awuGDDMIbFKkCkxYS+cDCMYbEKEGkxoQwtIk2kxSpApMWEMqWJdORIp1T/4uyevV5LxnAL9oRUA/6CBTj6n4eeXSnDJWzu1VoBJHq4BpttSgK3YMMAz/bh9sAjl6W7j5e5eIxeHFqx7UEvB9w78PP5SAuU+4UG/iqO5JQGeKIflhlaE2f+9ep2wAcGGWcBIl1N2AAAAABJRU5ErkJggg==","data:image/png;base64 ,iVBO Rw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwklEQVRoQ+2YOxLAIAhE4f6HNkPhJGNUsFLWtdXm8Vb8qIgUuWgogcFt0zC4YKFhGgarACMNJvSHQ8M0DFYBRhpMKJsWI81Ig1WAkQYTyi4NE+lS+p+vqob4DgjgEaxhEjj7v/TMLpxhDxYKOAILA9zC1sbUK0L6pjWCNZsEPu1Y8vZhG8eZ3RSGPeC26UTWj94CtXhbb1oRgK/lyPqjgVdfZtcBzwoUvU9vjfSqYW895LG0ajn9xcOz7M1DRdqDtfkHM01tATZrLWwAAAAASUVORK5CYII=","data:image/ png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwklEQVRoQ+2YOxLAIAhE4f6HNkPhJGNUsFLWtdXm8Vb8qIgUuWgogcFt0zC4YKFhGgarACMNJvSHQ8M0DFYBRhpMKJsWI81Ig1WAkQYTyi4NE+lS+p+vqob4DgjgEaxhEjj7v/TMLpxhDxYKOAILA9zC1sbUK0L6pjWCNZsEPu1Y8vZhG8eZ3RSGPeC26UTWj94CtXhbb1oRgK/lyPqjgVdfZtcBzwoUvU9vjfSqYW895LG0ajn9xcOz7M1DRdqDtfkHM01tATZrLWwAAAAASUVORK5CYII=","data:image/ png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAtElEQVRoQ+2YQQ6AIAwEy/8fjUFjoihkwwmG5axJp7MUJUVEjo1WMjDctg3DBYcN2zCsA440TOgHx4ZtGNYBRxom1EPLkXakYR1wpGFCPaWRkc75fRGbUsG8Fg64hj0hqcB/sAamXMS37CIN92DxwPeAejYBNbRaRxASuHfeLgWsDqAWVNm3eGDlH6Ds5Sm/tEYMLw2sFF/HVnlnWsNK8VsC9xqz1NBSDRtY6NSUU1qoe/iRA5ipbQGTWKy4AAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KG goAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAtElEQVRoQ+2YQQ6AIAwEy/8fjUFjoihkwwmG5axJp7MUJUVEjo1WMjDctg3DBYcN2zCsA440TOgHx4ZtGNYBRxom1EPLkXakYR1wpGFCPaWRkc75fRGbUsG8Fg64hj0hqcB/sAamXMS37CIN92DxwPeAejYBNbRaRxASuHfeLgWsDqAWVNm3eGDlH6Ds5Sm/tEYMLw2sFF/HVnlnWsNK8VsC9xqz1NBSDRtY6NSUU1qoe/iRA5ipbQGTWKy4AAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KG goAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxklEQVRoQ+2ZQQ6AIAwEy/8fjeFAJAgWvCDDelRMnJ21Rg1mFu2gLQgYbluG4YJNhmUYloAqDRP6wJFhGYYloErDhGpoqdKqNCwBVRomVFMaVekYnx9gQ0iI94YBbsEmTCRwDxYJ/AYr4FTxnf88eHZRhmvYPJx6+/Oc3tLwGxQO2APyji81/OUeLM+pn7GptijgkYB67wI5nKWGW0bqCy4tIoBn3s6OAx5pRCvAsiXLKz1jeGTtr4fWCMDsmuOAvYBwlfaAL9N6bQHsgLHAAAAAAElFTkSuQmCC"],"-3":[" data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAyElEQVRoQ+2ZwQqEMAwF0///6C4RhJIaapddMOPrTdDDZF7Sqs3Mur1oNQHDbcswXLDJsAzDKqBIw4ROODIsw7AKKNIwoRpairQiDauAIg0TqimNiHTv84fX1hxtXqWBr0AjYgTHA3sBRmgBE6Z0jDrGcCbnFcDZAEMNrdHw3a2p9NBaAccJfVw/6e/hal/NDhOxl8v08K+AvQAZNNJwGeCdM8AqDdkR81GG/wWMOHjsGEYAZ5PZ4bwYyNfDnRY47y3bw9/A+jMfU+tkAeKRCSEAAAAASUVORK5CYII= ","da ta:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAzklEQVRoQ+2ZQQrAIAwE4/8fbclBEKsxbQXNdr3Wy+ysUWgSkSw/WonA4LZpGFyw0DANgyXASoMJveHQMA2DJcBKgwnl0GKlWWmwBFhpMKG4UzrnLClpYe0VttIKaK0RfEjgGWwdRAtO4NkZOOF7Mdza65mHMGyF3kITOPqvFmuA9SZ1yKFVV3oEDHUteYB1z5GGPXeq5wWlgCGm9ErgYt6a1NvP8GrgmeXtwG8eMjXU08dHeGBPYHUo8MAQLy3PuT/2WvJUcuWekJX+EsAF8BZqAfbuIUMAAAAASUVORK5CYI I=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxklEQVRoQ+2ZSw6AMAhE4f6HrqkJSb+YGhc4TFduuni8gVZVESmSaCmBwW3TMLhgoWEaBqsAIw0mdMKhYRoGqwAjDSaUQ4uRZqTBKsBIgwnFntKl9N8jVWuA+wUR6RF0gmzAUwDXAphtAv9xaFmkzeIq4lCGV5J2Awwi0mmBd9O6PZ6gDHu9aymAB26PpPs56t9D7zKxukE99XH4Kf01sJlOYzg88MkFaLx41L27ARbW8Btgb0/4HiawU4F0r4cnaYDo4RPgC2DlagGlijT9AAAAAElFTkSuQmCC","data:im age/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAxElEQVRoQ+2ZSxLAEBAFx/0PLWWnMD6VBZ7OOhKtnxmVBDOL9tAVABa3jWFxwYZhDIutAJEWE1rhYBjDYitApMWEUrSINJEWWwEiLSaUKn11pGP0P7iGkNDq60rgHmiJWIIDfEPRyg3nBlvmJQz3pJTQACv8almp1lcWrTLSHnCrNQG8o0rP9FXvIJHmOxqfjz3C8GjCCaoHPIo4wDti/Oed3sHDi/dxhlfhZ7ZA/syngGVOWjOWZfvwypY4oi2tTPjvvR9OJWcBb3IIywAAAABJRU5ErkJggg=="],"-2":[" data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAyUlEQVRoQ+2ZSw6AMAhE6f0PXVMTI+nHCiuYTtfV+HhTiFpEpMpBqxAY3DYNgwsWGqZhsAow0mBCBxwapmGwCjDSYELZtBhpRhqsAow0mFB2aahI1/p+gC2loY0rNbAGXB3FHhweuBVCQx8BrKHTA8/O6izqz77UwKtzezwwzBnuDa+6Nhzw13gKO5Y8M7UZ/mNVJyFM0/IAW2Hv8RTp//AOWsfTAxsO2PKmtitOf6/0c5jAm3ikN2yJf8gu7QWwXheqS1sf3rP/Al8FYQHWgAqZAAAAAElFTkSuQmCC ","da ta:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAA0ElEQVRoQ+2ZSw6AIAxEy/0PjcEE0/AtuCAdhq1sXt8wSgwiEuWiFQgMbpuGwQULDdMw2AQYaTChFQ4N0zDYBBhpMKEsLUaakQabACMNJhS3pWOMEkIK7Hi5jXQCnK3WAFwCW2DzMEpoeOAErqEhgDNQzzwEcK+gWtDugUdldRXwDPY9zwj/lkatDdHSOtKWotL7jxu2vFNXCqp8DZXn3S3wqtnvQ+T0Gd4xvAvrsrQsA6pirC4VxyM9uwCUzwlsmJjrL63rDBuEDre4O8N/gR+0gmoBKz/gXAAAAABJRU5Erk Jggg==","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAwElEQVRoQ+2ZQQ6AIAwE2/8/GoOJEbFAuZXtcjaG7QwtURWRIomWMjA4bRIGBywkTMJgFaDSYEB/cUiYhMEqQKXBgLJpUWkqDVYBKg0GFL9Ll/J+k1StAn8XhNJtSMvQNniKwLUIT2gGPrFp9efWUhyKsAWpD83AJ6o823MawrPze3drpJ9po3l8xByeXSasG9SK7KN/WMI7gb1hQyudLrB3aqzu0e176lEIqzQDDypAwhM1IJT2qh9+LO0G8T5/Abt3ZwFj6rcvAAAAAElFTkSuQmCC","data:image/png; base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAuklEQVRoQ+2YOQ7AIAwEzf8fTUQRKeI0VHgz1KEYz2JbSWaW7UcnASxuG8Pigg3DGBarAJEWE9rgYBjDYhUg0mJCaVpEmkiLVYBIiwmlS4ePdM79n64pFbT2hAUegdaINXhIYC/sC/+FBjh6l+7ZD294JgVgM5M07B1PIZtWHWkvbLl3BfBqzIyWiNm9qxePE+Adq99EhDR8CntNpHdn/yoRs/XyCsMALyqA4UWBJBcP77MI+Ya9cL3vHmt3YQH4cIpTAAAAAElFTkSuQmCC"],"-1":["data:image/png;b ase64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAAqElEQVRoQ+2Y2wqAMAxD2///6MlAobh5oU9rdvYqCslJs6KbWbONjiNYnDaExQEbhCEs5gCRFgM6yIEwhMUcINJiQCktIk2kxRwg0mJAaWmJSLc2/nh179LGU1rwTOglEcGnExCu1NLbRTrCuYuXnGEEBwcgvFpLvxXQ193an5ebYQTP1sKHdbEk4cz9/ycV/buxwGQ3rWgggjNxWuGd7SKdMb30DGcEH3DQYQGvRuPHAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUh EUgAA ADwAAAAoCAYAAACiu5n/AAAAqElEQVRoQ+2ZWw7AIAzD2vsfmglp04A9xOdmzA1SJ1GBjIgSC51UMJy2hOGAQ8IShk1AS8OAXuRIWMKwCWhpGFBLS0tradgEtDQMqC2Ns3Qp/SNsZpV4HozgUeghUcGUd+klCVf7LpPhtpha0dgMK3ifgIS/3tJP7VsBjvQOW/86wwpu18RhbUQQnr29vTmhXTPxu3R3ccjkfJdK+CYLtdUxlp7N+nKCN2/iZAFlXCJGAAAAAElFTkSuQmCC","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA DwAAAAoCAYAAACiu5n/AAAArUlEQVRoQ+2aSQrAIBAEZ/7/aMMEBOMS8aZteRUC3dWzIHEzS3bRcQSL04awOGCDMITFHCDSYkAbORCGsJgDRFoMKE2LSBNpMQeItBhQurRMpFP6Pr66h7T2HC+4FlpK7IlG8GlNC8IFMclIZ3090gg203mXhnDQ7MzircbSX8eNWh0tE3F3JGEEV0uBHOHVpWeWiPy90qitahjBEwcgPDBIJtKrJfCOttv+4nkAEKxhAVYHl84AAAAASUVORK5CYII=","data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAYAAACiu5n/AAAArUlEQVRoQ+2aSQrAIBAEZ/7/aMMEBOMS8aZteRUC3dWzIHEzS3bRcQSL04awOGCDMITFHCDSYkAbORCGsJgDRFoMKE2LSBNpMQeItBhQurRMpFP6Pr66h7T2HC+4FlpK7IlG8GlNC8IFMclIZ3090gg203mXhnDQ7MzircbSX8eNWh0tE3F3JGEEV0uBHOHVpWeWiPy90qitahjBEwcgPDBIJtKrJfCOttv+4nkAEKxhAVYHl84AAAAASUVORK5CYII="]}}
+
+
+
+/*
+================================================================================================================================
+IMAGE PROCESSING SHOW IMAGES ON SCREEN
+================================================================================================================================
+*/
+
+function cloneCanvas(oldCanvas) {
+
+    //create a new canvas
+    var newCanvas = document.createElement('canvas');
+    var context = newCanvas.getContext('2d');
+
+    //set dimensions
+    newCanvas.width = oldCanvas.width;
+    newCanvas.height = oldCanvas.height;
+
+    //apply the old canvas to the new one
+    context.drawImage(oldCanvas, 0, 0);
+
+    //return the new canvas
+    return newCanvas;
+}
+
+/*
+================================================================================================================================
+VIDEO CAPTURE
+================================================================================================================================
+*/
+
+// The Zwift app tries to keep the display box with the gradient in it at a fixed height as a percentage
+// of the screen height regardless of the screen width.
+// Therefore to get a reliable sized image, force the screen capture height and let the width adjust
+// as required.
+
+class VideoCapture {
+  constructor(preload){
+    console.log('Preloading', preload)
+
+    this._mode = null;
+    this._video = document.querySelector('#video');
+    this._video_canvas = document.querySelector('#video_copy');
+    this._ctx = this._video_canvas.getContext('2d');
+    this._crop_canvas = document.querySelector('#crop');
+    this._crop_ctx = this._crop_canvas.getContext('2d');
+    this._crop_shape = null;
+    this._maskShape = {w:60, h:40}//{w: 50, h: 30}
+    this._frame_rate = 1;
+    this._raw_width = 0;
+    this._raw_height = 0;
+    this._working_height = 1000; // pixels
+    this._working_width = null;  // adjusted according to source dimensions.
+    this._importantColours = [
+      [[240, 255],[240, 255], [240, 255]], // white
+      [[250, 255],[0, 10], [0, 5]], // red on zwift
+      [[225, 232],[48,53], [32,37]],  // red on video copy
+      [[235, 240],[190, 195], [10,20]], // yellow on zwift
+      [[235, 245],[105, 110], [55,70]], // dark orange on zwift
+      [[230, 233],[103,107],[57,61]], // dark orange on video copy
+    ]
+    this._importantColourIndex = {
+      white: [0],
+      red: [1,2],
+      yellow: [3],
+      orange: [4,5]
+    }
+
+    this._learning_list = [];
+    this._last_score = -1;
+    this._last_classifier = -20;
+    this._previous = [];
+
+    this._onsample = null;
+    this._onclassify = null;
+
+    // Database
+
+    this._samples = [];
+    this._ref_images = {};
+
+    // Initialise
+    for ( let i = -20; i <= 20; i++ ){
+      this._ref_images[i] = [];
+    }
+
+
+    let self = this;
+    let enabled = false;
+
+    // Listen for a video feed starting and grab the height and width of raw image
+    this._video.addEventListener( "loadedmetadata", function (e) {
+      self.initialise();
+      enabled = true;
+    })
+
+
+    setInterval(()=>{
+      if ( enabled ){
+
+        let now = new Date();
+
+        // Re size the frame
+
+        self._ctx.clearRect(0, 0, self._working_width , self._working_height);
+        self._ctx.imageSmoothingEnabled = true;
+        self._ctx.drawImage(self._video, 0, 0, self._raw_width , self._raw_height, 0, 0, self._working_width , self._working_height);
+
+        // console.log('Resize', new Date() - now, 'ms')
+
+        // Show box being watched
+
+        self._ctx.beginPath();
+        self._ctx.strokeStyle = 'blue';
+        self._ctx.strokeWidth = 2;
+        self._ctx.rect(self._crop_shape.x, self._crop_shape.y, self._crop_shape.w, self._crop_shape.h)
+        self._ctx.stroke();  
+
+        // Take crop
+
+        self._crop_canvas.width = self._maskShape.w;
+        self._crop_canvas.height = self._maskShape.h;
+        self._crop_ctx.imageSmoothingEnabled = true;
+        self._crop_ctx.drawImage(self._video_canvas, self._crop_shape.x, self._crop_shape.y, self._crop_shape.w , self._crop_shape.h, 0, 0, self._maskShape.w, self._maskShape.h);
+
+          // console.log('Crop produced', new Date() - now, 'ms')
+
+        let fd = new FeatureDetector(self._crop_canvas, self._importantColours);
+        fd.canvas(self._crop_canvas); // show in black and white
+        // console.log('Converted to feature descriptor', new Date() - now, 'ms')
+
+        // Find edges and make a mask
+
+        // let fd2 = new FeatureDetector(self._crop_canvas, self._importantColours);
+        // fd.applyFilter('laplace',100)
+        // fd2.blur(3);
+        // fd.subtract(fd2, 80);
+        fd.threshold(1)
+        // let size = self._maskShape.h/20
+        // fd.segment(Math.floor(size), 0);
+
+        // Show what was done
+
+        fd.canvas(work)
+
+
+        // Try to find a better position if necessary
+        let frameBlack = fd.percentageBlack();
+        if ( frameBlack > 0.97 ){
+          console.log('Relocating percentage character', frameBlack)
+          self.locateGradient();
+        } else {
+
+
+          // console.log('Processed feature descriptor', new Date() - now, 'ms')
+
+          let best = {score: 0, classifier: 0}
+          for ( let classifier of Object.keys(self._ref_images)){
+            for ( let mask of self._ref_images[classifier] ){
+              let colours = [];
+              classifier = parseInt(classifier);
+              if ( [3,4,5,6].includes(classifier) ){
+                for ( let c of self._importantColourIndex.yellow ){
+                  colours.push(c)
+                }
+              }
+              if ( classifier <= 3 ){
+                for ( let c of self._importantColourIndex.white ){
+                  colours.push(c)
+                }
+              }
+              if ( ([6,7,8,9]).includes(classifier)){
+                for ( let c of self._importantColourIndex.orange ){
+                  colours.push(c)
+                }
+              }
+              if ( classifier >= 9 ){
+                for ( let c of self._importantColourIndex.red ){
+                  colours.push(c)
+                }
+              }
+              let score = fd.match(mask, self._importantColours, colours);
+              if ( score > best.score ){
+                best.score = score;
+                best.classifier = classifier;
+              }
+            }
+          }
+          console.log('Best match', best)
+          if ( autoLog ){
+            postData('/save-image', {classifier: best.classifier, score: (best.score * 100).toFixed(0) + '%', image: work.toDataURL()})
+            .catch((err)=>{
+              console.error(err)
+            })          
+          }
+
+          if ( !self._mode ){ // if changed
+            self._last_classifier = best.classifier;
+            setBikeHeight(parseInt(best.classifier)); 
+          }
+
+
+          let guess = document.getElementById('guess');
+          //guess.textContent = best.classifier;       
+            console.log('Matched', new Date() - now, 'ms')
+          guess.textContent = best.classifier + '%';
+          document.getElementById("guess_confidence").textContent = (best.score * 100).toFixed(0) + '%';
+
+          if ( autoLog && best.score < 0.90  && this._video.srcObject ){
+
+            /* See if known from previous update */
+
+            let retryScore = {score: 0, classifier: null, image: null};
+            for ( let mask of self._previous ){
+              let classifier = mask.classifier;
+              let colours = [];
+              classifier = parseInt(classifier);
+              Object.keys(self._importantColourIndex).forEach((colourName)=>{
+                for ( let c of self._importantColourIndex[colourName] ){
+                  colours.push(c)
+                }
+              })
+              let score = fd.match(mask.image, self._importantColours, colours);
+              if ( score > retryScore.score ){
+                retryScore.score = score;
+                retryScore.classifier = classifier;
+                retryScore.image = mask.image;
+              }
+            }
+            console.log('Retry match?', retryScore.score)
+            if ( retryScore.score < 0.9 ){             
+              self._previous.push({classifier: best.classifier, image: fd})
+              fd.canvas(document.getElementById('hotspot'))
+              console.log('Capturing new image')
+              capture();
+            } else {
+              console.log('Matched to a previously unknown entry so new version not needed')
+              document.getElementById("guess_confidence").textContent = (retryScore.score * 100).toFixed(0) + '% from previously captured unknown';
+              retryScore.image.canvas(document.getElementById('hotspot'))
+            }
+            console.log('Previous list size', self._previous.length)
+
+          } else {
+                          fd.canvas(document.getElementById('hotspot'))
+          }
+
+          if ( self._mode ){ // diagnostic code
+            let c = document.createElement('canvas');
+            fd2 = new FeatureDetector(c, self._importantColours);
+            self._ref_images[best.classifier][0].canvas(c);
+            let box = document.getElementById('guess_match_canvas')
+            box.innerHTML = '';
+            box.appendChild(c)
+
+            if ( best.score.toFixed(2) != self._last_score || best.classifier !== self._last_classifier ){
+              self._last_score = best.score.toFixed(2);
+              self._last_classifier = best.classifier;
+              self._learning_list.push({score: best.score.toFixed(3), classifier: best.classifier, image: cloneCanvas(work), guess: cloneCanvas(c)});
+
+              let l = document.getElementById('learning');
+              l.innerHTML = '';
+              self._learning_list.forEach((item)=>{
+                let r = document.createElement('tr');
+                l.appendChild(r);
+                let td;
+                td = document.createElement('td')
+                td.appendChild(item.image)
+                td.onclick=(()=>{
+                  let fd = new FeatureDetector(item.image);
+                  self.addSample(fd.clone());              
+                })
+                r.appendChild(td);
+                td = document.createElement('td')
+                td.innerHTML = item.score;
+                r.appendChild(td);
+                td = document.createElement('td')
+                td.innerHTML = item.classifier;
+                r.appendChild(td);
+                td = document.createElement('td')
+                td.appendChild(item.guess)
+                r.appendChild(td);
+              })
+            }
+
+            if ( best.score < 0.90 && this._video.srcObject ){
+              console.log('Capturing new image')
+              capture();
+
+            }
+          }
+        }
+      }
+
+    }, 1000 / self._frame_rate);
+
+    // Raw video may be any dimension
+
+    // Copy will be 1000 pixels wide
+    // but unknown height
+
+    document.getElementById('start').onclick = this.startCapture.bind(self);
+    document.getElementById('stop').onclick = this.stopCapture.bind(self);
+
+  }
+
+  // Button event for user 
+  async startCapture() {
+
+    var displayMediaOptions = {
+      video: {
+        cursor: "always",
+        frameRate: 10
+      },
+      audio: false
+    };
+
+    try {
+      this._video.srcObject = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
+    } catch(err) {
+      console.error("Error: " + err);
+    }
+  } 
+
+  locateGradient(){
+    let self = this;
+      try{
+        self._raw_width = self._video.videoWidth;
+        self._raw_height = self._video.videoHeight;
+
+        // Determine the working area dimensions based on a fixed height
+
+        let heightRatio = self._working_height / self._raw_height;
+        self._working_width = self._raw_width * heightRatio;
+        document.querySelector('#videoSize').textContent = 'Source W:' + self._raw_width + ' x H:' + self._raw_height + '   Screen: W:' + self._working_width.toFixed(0) + ' x H:' + self._working_height.toFixed(0);
+
+        self._video_canvas.height = self._working_height;
+        self._video_canvas.width = self._working_width;
+
+        // Determine the position of the region of interest
+
+        // Take an initial frame to examine
+
+        self._ctx.clearRect(0, 0, self._working_width , self._working_height);
+        self._ctx.imageSmoothingEnabled = true;
+        self._ctx.drawImage(self._video, 0, 0, self._raw_width , self._raw_height, 0, 0, self._working_width , self._working_height);
+
+        // There will be a white(ish) box in the middle.  Where as any 'window' white areas will be across the whole window.
+        // So find a white(ish) line that does not reach across the screen
+
+        let fd = new FeatureDetector(self._video_canvas);  // keep all colours
+
+        let percentage = fd.locatePercentCharacter();
+        console.log('Percentage', percentage)
+
+        // Show where it was found
+
+        self._ctx.fillStyle = 'rgba(0,255,0,1)';
+        self._ctx.fillRect( percentage[0], percentage[1], 16, 16 );
+
+        // Now locate a rectangle over where the real number should be
+
+        let digitWidth = 60
+        let digitHeight = 40
+
+        self._ctx.beginPath();
+        self._ctx.strokeStyle = 'red';
+
+        percentage[1] += 16;
+        self._ctx.moveTo(percentage[0], percentage[1]);
+        self._ctx.lineTo(percentage[0], percentage[1] - digitHeight);
+        self._ctx.lineTo(percentage[0] - digitWidth, percentage[1] - digitHeight);
+        self._ctx.lineTo(percentage[0] - digitWidth, percentage[1]);
+        self._ctx.lineTo(percentage[0], percentage[1]);
+        self._ctx.stroke();  
+
+        let targetX = percentage[0] - digitWidth;
+        let targetY = percentage[1] - digitHeight;
+
+        //self._crop_shape = {x: cropX, y: Math.round(targetY * 0.7), w: targetX - cropX, h: Math.round(targetY / 2)}
+        self._crop_shape = {x : targetX, y: targetY, w: digitWidth, h: digitHeight}
+
+    }
+    catch(e){
+      console.error(e)
+    }
+
+  }
+
+  initialise(){
+    let self = this;
+      try{
+        self.locateGradient();
+
+        // Now we know the screen sizes, load the old data and adjust for size
+
+        if ( preload ){
+          console.log('Parsing preload data')
+          self.load(preload);
+
+
+        }
+
+    }
+    catch(e){
+      console.error(e)
+    }
+  }
+
+
+  // Button event for user 
+  stopCapture(evt) {
+    let tracks = this._video.srcObject.getTracks();
+    tracks.forEach(track => track.stop());
+    this._video.srcObject = null;
+  } 
+
+  addSample(sample){
+    this._samples.push(sample);
+    if ( this._onsample ){
+      this._onsample(this._maskShape, this._samples)
+    }
+  }
+
+  addClassification(classifier, sample){
+    console.log('Classifying', classifier, sample)
+    this._ref_images[classifier].push(sample);
+    if ( this._onclassify ){
+      this._onclassify(this._maskShape, this._ref_images)
+    }
+  }
+
+  removeClassifier(classifier){
+    this._ref_images[classifier] = [];
+    if ( this._onclassify ){
+      this._onclassify(this._maskShape, this._ref_images)
+    }
+  }
+
+  set onSample(fn){
+    this._onsample = fn;
+  }
+
+  set onClassification(fn){
+    this._onclassify = fn;
+  }
+
+  get cropShape(){
+    return this._maskShape;
+  }
+
+  getClassified(){
+    return this._ref_images;
+  }
+
+  getTraining(){
+    console.log('Training data', this._samples)
+    return this._samples;
+  }
+
+  export(){
+    let exportData = {cropShape: this._maskShape, source: this._crop_shape, samples: [], classified:{}};
+    for ( let i = -20; i <= 20; i++ ){
+      exportData.classified[i] = [];
+      this._ref_images[i].forEach((x)=>{
+        let c = document.createElement('canvas');
+        x.canvas(c);
+        exportData.classified[i].push(c.toDataURL());
+      })
+    }
+
+    console.log(JSON.stringify(exportData));
+  }
+
+  load(data){
+    this._samples = data.samples;
+    this._ref_images = {};
+        let self = this;
+
+   for ( let i = -20; i <= 20; i++ ){
+      let key = i;
+      self._ref_images[key] = [];
+      data.classified[key].forEach((url)=>{
+
+        let image = new Image();
+        image.onload = ()=>{
+
+          // Create a canvas of exported image
+
+          const mask = document.createElement('canvas');
+          const ctx = mask.getContext('2d')
+          mask.width = data.cropShape.w;
+          mask.height = data.cropShape.h;
+          ctx.drawImage(image, 0, 0, self.cropShape.w, self.cropShape.h);
+
+          // Now create a canvas of the source shape and
+          // draw the original onto that
+
+          // Now create a canvas of the new source shape
+          // and draw the old source image onto the new one
+
+          // Finally create a standard crop of this scale image
+          let fd = new FeatureDetector(mask, self._importantColours);
+          // console.log('pre load', key, fd, mask)
+          self._ref_images[key].push(fd);
+        }
+        image.src = url;
+      })
+
+    }
+    setTimeout(()=>{
+      renderTraining(self._maskShape, self.getTraining());
+      renderTrained(self._maskShape, self.getClassified());
+    },3000)
+  }
+
+}
+
+function exportDB(){
+  video.export();
+}
+
+function capture(){
+  let work = document.querySelector('#work');
+  let fd = new FeatureDetector(work);
+
+  // Store in database of samples
+
+  video.addSample(fd.clone());
+}
+
+async function postData(url = '', data = {}) {
+  // Default options are marked with *
+  const response = await fetch(url, {
+    method: 'POST', // *GET, POST, PUT, DELETE, etc.
+    mode: 'cors', // no-cors, *cors, same-origin
+    cache: 'no-cache', // *default, no-cache, reload, force-cache, only-if-cached
+    credentials: 'same-origin', // include, *same-origin, omit
+    headers: {
+      'Content-Type': 'application/json'
+      // 'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    redirect: 'follow', // manual, *follow, error
+    referrerPolicy: 'no-referrer', // no-referrer, *no-referrer-when-downgrade, origin, origin-when-cross-origin, same-origin, strict-origin, strict-origin-when-cross-origin, unsafe-url
+    body: JSON.stringify(data) // body data type must match "Content-Type" header
+  });
+  return response.json(); // parses JSON response into native JavaScript objects
+}
+
+function startLogging(){
+  autoLog = true;
+}
+
+function rescan(){
+  video.initialise();
+}
+
+
+// helper function to get an element's exact position
+function getPosition(el) {
+  var xPosition = 0;
+  var yPosition = 0;
+ 
+  while (el) {
+    if (el.tagName == "BODY") {
+      // deal with browser quirks with body/window/document and page scroll
+      var xScrollPos = el.scrollLeft || document.documentElement.scrollLeft;
+      var yScrollPos = el.scrollTop || document.documentElement.scrollTop;
+ 
+      xPosition += (el.offsetLeft - xScrollPos + el.clientLeft);
+      yPosition += (el.offsetTop - yScrollPos + el.clientTop);
+    } else {
+      xPosition += (el.offsetLeft - el.scrollLeft + el.clientLeft);
+      yPosition += (el.offsetTop - el.scrollTop + el.clientTop);
+    }
+ 
+    el = el.offsetParent;
+  }
+  return {
+    x: xPosition,
+    y: yPosition
+  };
+}
+
+
+function renderTrained(cropShape, trainedData) {
+  console.log('Rendering trained data', trainedData)
+      let t = document.querySelector('#trained');
+      t.innerHTML = '';
+      Object.keys(trainedData).forEach((classification)=>{
+        let list = trainedData[classification];
+
+            let template = document.createElement('template');
+            template.innerHTML = `<tr>
+            <td>${classification}</td>
+            <td class="masks"></td>
+            <td>Common Area: <canvas class="hot"/></td>
+            <td>
+              <button>Delete</button>
+            </td>
+            </tr>`;
+            t.appendChild(template.content.cloneNode(true));
+            let r = t.querySelector('tr:last-child');
+            let masks = r.querySelector('.masks');
+          
+            let hot = r.querySelector('.hot');
+            hot.width = cropShape.w;
+            hot.height = cropShape.h;
+            let fd = new FeatureDetector(hot);
+            fd.setBlack();
+            for ( let mask of list ){
+              fd.add(mask,1);
+            }
+            fd.brighten();
+            fd.canvas(hot);
+
+            for ( let mask of list ){
+              let c = document.createElement('canvas');
+              mask.canvas(c);
+              masks.appendChild(c);
+            }
+            r.onclick = (e)=>{
+              if ( e.target.textContent == 'Delete' ){
+                video.removeClassifier(classification);
+                renderTraining(cropShape, video.getTraining());
+                renderTrained(cropShape, video.getClassified());
+              } 
+            }
+        })
+}
+
+function renderTraining(cropShape, trainingData) {
+      let t = document.querySelector('#training');
+      t.innerHTML = '';
+
+      trainingData.forEach((sample, idx)=>{
+        let template = document.createElement('template');
+        let currentData;
+        currentData = sample;
+        let mask = document.createElement('canvas');
+        mask.height = cropShape.h;
+        mask.width = cropShape.w;
+        let fd = new FeatureDetector(mask);
+        fd.replaceData(sample);
+        fd.canvas(mask);
+
+        template.innerHTML = `<tr>
+        <td><img class='mask' src="${mask.toDataURL()}"/></td>
+        <td>
+          <label>T / L / B / R<input type="radio" name="side_${idx}" value="top"> 
+          <input type="radio" name="side_${idx}" value="left"> 
+          <input type="radio" name="side_${idx}" value="bottom"> 
+          <input type="radio" name="side_${idx}" value="right"> </label>
+          </td>
+        <td><input type="text"/></td>
+        <td>
+          <button>Save</button>
+          <button>Delete</button>
+        </td>
+        </tr>`;
+        t.appendChild(template.content.cloneNode(true));
+        let r = t.querySelector('tr:last-child');          
+        r.onclick = (e)=>{
+          if ( e.target.textContent == 'Save' ){
+            let value = e.target.parentNode.parentNode.querySelector('input[type="text"]').value;
+            let fd = new FeatureDetector(mask);
+            video.addClassification(value, fd);
+            renderTraining(cropShape, video.getTraining());
+            renderTrained(cropShape, video.getClassified());
+          } 
+          if ( e.target.textContent == 'Delete' ){
+            renderTraining(cropShape, video.getTraining());
+          } 
+        }
+        let image = r.querySelector('.mask');
+        image.src = mask.toDataURL();
+        image.onclick = (e)=>{
+          console.log('image click')
+          let choice = r.querySelector('input[name="side_' + idx + '"]:checked');
+          if ( choice ){
+            console.log(choice.value);
+                // console.log('Width = ', video.width)
+            let pos = getPosition(image);
+            let x = e.clientX - pos.x;
+            let y = e.clientY - pos.y;
+            let canvas = document.createElement('canvas');
+            canvas.height = mask.height;
+            canvas.width = mask.width;
+            let ctx = canvas.getContext('2d');
+            ctx.drawImage(mask, 0, 0, mask.width, mask.height);
+
+            switch ( choice.value ){
+              case 'top':
+                ctx.fillStyle = "black";
+                ctx.fillRect(0, 0, mask.width, y);
+                break;
+              case 'left':
+                ctx.fillStyle = "black";
+                ctx.fillRect(0, 0, x, mask.height);
+                break;
+              case 'bottom':
+                ctx.fillStyle = "black";
+                ctx.fillRect(0, y, mask.width, mask.height);
+                break;
+              case 'right':
+                ctx.fillStyle = "black";
+                ctx.fillRect(x, 0, mask.width, mask.height);
+                break;
+            }
+            let mctx = mask.getContext('2d');
+            mctx.drawImage(canvas, 0, 0, mask.width, mask.height);
+            currentData = mask.toDataURL();
+            image.src = currentData;
+
+          }
+        }
+        let down = false;
+        r.onmousemove = (e) => {
+            if ( !down ) return;
+
+        }
+        r.onmousedown = (e) => {
+          down = true;
+        }
+        r.onmouseup = (e) => {
+          down = false;
+        }
+      })
+
+}
+
+
+let video = new VideoCapture(preload);
+video.onSample = renderTraining;
+video.onClassification = renderTrained;
+
+/*
+================================================================================================================================
+Fast Guassian Matrix convolution approximation
+================================================================================================================================
+*/
+
+
+
+
+function boxesForGauss(sigma, n)  // standard deviation, number of boxes
+{
+    var wIdeal = Math.sqrt((12*sigma*sigma/n)+1);  // Ideal averaging filter width 
+    var wl = Math.floor(wIdeal);  if(wl%2==0) wl--;
+    var wu = wl+2;
+        
+    var mIdeal = (12*sigma*sigma - n*wl*wl - 4*n*wl - 3*n)/(-4*wl - 4);
+    var m = Math.round(mIdeal);
+    // var sigmaActual = Math.sqrt( (m*wl*wl + (n-m)*wu*wu - n)/12 );
+        
+    var sizes = [];  for(var i=0; i<n; i++) sizes.push(i<m?wl:wu);
+    return sizes;
+}
+
+function gaussBlur_4 (scl, tcl, w, h, r) {
+    var bxs = boxesForGauss(r, 3);
+    boxBlur_4 (scl, tcl, w, h, (bxs[0]-1)/2);
+    boxBlur_4 (tcl, scl, w, h, (bxs[1]-1)/2);
+    boxBlur_4 (scl, tcl, w, h, (bxs[2]-1)/2);
+    // boxBlur_4 (tcl, scl, w, h, (bxs[3]-1)/2);
+    // boxBlur_4 (scl, tcl, w, h, (bxs[4]-1)/2);
+}
+function boxBlur_4 (scl, tcl, w, h, r) {
+    for(var i=0; i<scl.length; i++) tcl[i] = scl[i];
+    boxBlurH_4(tcl, scl, w, h, r);
+    boxBlurT_4(scl, tcl, w, h, r);
+}
+function boxBlurH_4 (scl, tcl, w, h, r) {
+    var iarr = 1 / (r+r+1);
+    for(var i=0; i<h; i++) {
+        var ti = i*w, li = ti, ri = ti+r;
+        var fv = scl[ti], lv = scl[ti+w-1], val = (r+1)*fv;
+        for(var j=0; j<r; j++) val += scl[ti+j];
+        for(var j=0  ; j<=r ; j++) { val += scl[ri++] - fv       ;   tcl[ti++] = Math.round(val*iarr); }
+        for(var j=r+1; j<w-r; j++) { val += scl[ri++] - scl[li++];   tcl[ti++] = Math.round(val*iarr); }
+        for(var j=w-r; j<w  ; j++) { val += lv        - scl[li++];   tcl[ti++] = Math.round(val*iarr); }
+    }
+}
+function boxBlurT_4 (scl, tcl, w, h, r) {
+    var iarr = 1 / (r+r+1);
+    for(var i=0; i<w; i++) {
+        var ti = i, li = ti, ri = ti+r*w;
+        var fv = scl[ti], lv = scl[ti+w*(h-1)], val = (r+1)*fv;
+        for(var j=0; j<r; j++) val += scl[ti+j*w];
+        for(var j=0  ; j<=r ; j++) { val += scl[ri] - fv     ;  tcl[ti] = Math.round(val*iarr);  ri+=w; ti+=w; }
+        for(var j=r+1; j<h-r; j++) { val += scl[ri] - scl[li];  tcl[ti] = Math.round(val*iarr);  li+=w; ri+=w; ti+=w; }
+        for(var j=h-r; j<h  ; j++) { val += lv      - scl[li];  tcl[ti] = Math.round(val*iarr);  li+=w; ti+=w; }
+    }
+}
+
+function blurImage(ctx, width, height, sigma){
+  let h = height;
+  let w = width;
+  let d = ctx.getImageData(0, 0, width, height);
+
+  let rData = new Uint8ClampedArray(d.data.length / 4);
+  let gData = new Uint8ClampedArray(d.data.length / 4);
+  let bData = new Uint8ClampedArray(d.data.length / 4);
+
+  for (let i = 0; i < d.data.length; i = i + 4) {
+  rData[i / 4] = (d.data[i]);
+   gData[i / 4] = (d.data[i + 1]);
+   bData[i / 4] = (d.data[i + 2]);
+  }
+
+  gaussBlur_4(rData, rData, w, h, sigma);
+  gaussBlur_4(gData, gData, w, h, sigma);
+   gaussBlur_4(bData, bData, w, h, sigma);
+
+  for (let i = 0; i < d.data.length; i = i + 4) {
+  d.data[i] = rData[i / 4]
+  d.data[i + 1] = gData[i / 4]
+  d.data[i + 2] = bData[i / 4]
+  d.data[i + 3] = 255
+  }
+  ctx.putImageData(d, 0, 0);  
+}
+
+
+
+/*
+================================================================================================================================
+Canvas image data analysis
+================================================================================================================================
+*/
+
+
+let transforms = {
+  "edges" : [
+    [0, -1, 0],
+    [-1, 3, -1],
+    [0, -1, 0]
+  ], 
+  "sobel_h": [
+    [-1, -2, -1],
+    [ 0,  0,  0],
+    [ 1,  2,  1]
+  ],
+  "sobel_v": [
+    [-1, 0, 1],
+    [-2,  0,  2],
+    [-1,  0,  1]
+  ],
+  "sharpen": [
+    [-1, -1, -1],
+    [-1, 9, -1],
+    [-1, -1, -1]
+  ],
+  "laplace": [
+    [-10,-10,-10],
+    [-10,80,-10],
+    [-10,-10,-10]  
+  ]
+};
+
+
+
+/*
+** Take a canvas and get the data into a matrix.
+** Apply filters to the data efficiently
+** Reproduce a canvas from a matrix
+*/
+class FeatureDetector {
+  constructor(canvas, keepColours){
+    this._canvas = canvas;
+    this._width = canvas.width;
+    this._height = canvas.height;  
+    this._ctx = canvas.getContext('2d');
+    this._data = this._ctx.getImageData(0, 0, this._width, this._height).data;
+    this._buffer = new Uint8ClampedArray(this._height * this._width);
+    // Convert to Grey
+    for (let y = 0; y < this._height; y++) {
+      for (let x = 0; x < this._width; x++) {
+        let px = (y * this._width + x) * 4;
+        if ( keepColours ){
+          let keep = false;
+          keepColours.forEach((c)=>{
+            keep = keep || (
+              ( this._data[px+0] >= c[0][0] && this._data[px+0] <= c[0][1] ) &&
+              ( this._data[px+1] >= c[1][0] && this._data[px+1] <= c[0][1] ) &&
+              ( this._data[px+2] >= c[2][0] && this._data[px+2] <= c[0][1] )
+            )
+          })
+          if ( keep ){
+            this._buffer[y * this._width + x] = ( (0.3 * this._data[px]) + (0.59 * this._data[px+1]) + (0.11 * this._data[px+2]) )
+          } else {
+            this._buffer[y * this._width + x] = 0;
+          }
+        } else {
+          this._buffer[y * this._width + x] = ( (0.3 * this._data[px]) + (0.59 * this._data[px+1]) + (0.11 * this._data[px+2]) )
+        }
+      }
+    }
+  }
+  // Return the current result into the canvas
+  canvas(target){
+    let ctx = target.getContext('2d');
+    let result = ctx.createImageData(this._width, this._height);
+    let output = result.data;
+    for (var y = 0; y < this._height; y++) {
+      for (var x = 0; x < this._width; x++) {
+        var v = this._buffer[y * this._width + x];
+        let tpx = (y * this._width + x) * 4;
+        output[tpx] = v;
+        output[tpx+1] = v;
+        output[tpx+2] = v;
+        output[tpx+3] = 255;
+      }
+    }
+    target.height = this._height;
+    target.width = this._width;
+    ctx.putImageData(result, 0, 0);
+  }
+
+  blur(sigma){
+    gaussBlur_4(this._buffer, this._buffer, this._width, this._height, sigma);
+  }
+
+  subtract(fd, threshold){
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      this._buffer[i] = this._buffer[i] > 0 ? Math.trunc(this._buffer[i] - fd._buffer[i]) * threshold : 0
+      //this._buffer[i] = Math.abs(this._buffer[i] - fd._buffer[i]) * threshold
+    }
+  }
+
+  setBlack(){
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      this._buffer[i] = 0;
+    }
+  }
+
+  add(fd, scale){
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      let x = this._buffer[i]
+      x += (fd._buffer[i]>200)?scale:0
+      if ( x > 255 ){
+        x = 255;
+      }
+      this._buffer[i] = x
+    }
+  }
+
+  brighten(){
+    let m = 0;
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      let x = this._buffer[i]
+      if ( x > m ){
+        m = x;
+      }
+    }
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      this._buffer[i] = (this._buffer[i] == m)?255:0
+    }
+
+  }
+
+  getColour(){
+    // self._crop_shape.w - 12, self._crop_shape.h - 14, 8, 8
+
+    let r = [];
+    let g = [];
+    let b = [];
+
+    console.log(this._height - 14, this._height - 6 )
+
+    for (let y = this._height-10; y < this._height-6; y++) {
+      for (let x = this._width-10; x < this._width-4; x++) {
+        let px = (y * this._width + x) * 4;
+        r.push(this._data[px+0])
+        g.push(this._data[px+1])
+        b.push(this._data[px+2])
+      }
+    }
+
+    // sort them
+
+    r = r.sort();
+    g = g.sort();
+    b = b.sort();
+
+    let m = Math.floor(r.length / 2);
+
+    return [r[m], g[m], b[m]]
+
+  }
+
+  threshold(threshold){
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      this._buffer[i] = this._buffer[i] > threshold ? 255 : 0
+    }    
+  }
+
+  combine(fd){
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      this._buffer[i] = this._buffer[i] + fd._buffer[i]
+    }
+  }
+
+  clone(){
+    let result = new Uint8ClampedArray(this._height * this._width);
+    for ( var i = 0; i < this._buffer.length; i++ ){
+      result[i] = this._buffer[i];
+    }
+    return {_buffer: result};
+  }
+
+  segment(size, threshold){
+    let height = this._height;
+    let width = this._width;
+    console.log('Segment', size, threshold)
+    
+    for (let y = 0; y < height; y = y + size) {
+      for (let x = 0; x < width; x = x + size) {
+        let s = 0;
+        // Scan the square
+        for ( let xx = x; xx < x + size; xx++){
+          for ( let yy = y; yy < y + size; yy++){
+            let px = (yy * width + xx);
+            s += (this._buffer[px] > 200)?1:0
+          }
+        }
+        let v = 0; // black
+        if ( s > threshold ){
+          v = 255; // white
+        }
+        // set whole area to white else black
+        for ( let xx = x; xx < x + size; xx++){
+          for ( let yy = y; yy < y + size; yy++){
+            let px = (yy * width + xx);
+            this._buffer[px] = v;
+          }
+        }
+      }
+    }
+
+  }
+
+  replaceData(fd){
+    this._buffer = fd._buffer;
+  }
+
+  applyFilter(transformName, factor){
+
+    const t = transforms[transformName];
+
+    let w = t[0].length;
+    let h = w;
+    let half = Math.floor(h / 2);
+    let self = this;
+    let result = new Uint8ClampedArray(this._height * this._width);
+    let height = this._height;
+    let width = this._width;
+
+    for (var y = half; y < height - half; y++) {
+      for (var x = half; x < width - half; x++) {
+        var px = (y * width + x) ;
+        var v = 0
+
+        for (var cy = 0; cy < h; cy++) {
+          for (var cx = 0; cx < w; cx++) {
+            var cpx = ((y + (cy - half)) * width + (x + (cx - half)));
+            v += (self._buffer[cpx] * t[cy][cx]);
+          }
+        }
+
+        result[px] = v * factor;
+
+      }
+    }
+
+    this._buffer = result;
+  }
+
+
+  summedAreaTable(){
+
+    let table = [];
+    let height = this._height;
+    let width = this._width;
+    let data = this._data;
+
+      function gray(r,g,b){
+        return ( (0.3 * r) + (0.59 * g) + (0.11 * b) )
+      }
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let px = (y * width + x) * 4;
+
+          let g = gray(data[px+0], data[px+1], data[px+2]) / 256;
+          let i = g;
+          if ( y > 0 ){
+            if ( x > 0 ){
+              i = i + table[(y-1)*width+x] + table[y*width+(x-1)] - table[(y-1)*width + (x-1)]
+            } else {
+        i = i + table[(y-1)*width+x]
+            }
+          } else {
+            if ( x > 0 ){
+              i = i + table[(x-1)]
+            } else {
+        i = i 
+            }
+          }
+          table[(y*width)+x] = i;
+
+      }
+    }
+    return {table:table, height: height, width: width};
+
+
+  }
+
+  // type = 0 for horizontal split B/W, 
+  //        1 = horizontal split W/B
+  //        2 for vertical split B | W  
+  //        3 = B | W
+  //        4 = horizontal strip B / W/ B
+  //        5 =                  W / B / W
+  //        6 = vertical         B | W | B
+  //        7 =                  W | B | W
+  //        8 = box              W middle
+  //        9 = box              B middle
+  // Dims = [[x, y, w, h], [x, y, w, h] ... ]
+  // where first dim 
+
+
+  haarFeature(summedAreaTable, type, matrixDims){
+    let score = 0;
+
+    function getAreaSum(dims){
+      let [x1, y1, x2, y2] = dims;
+      //console.log(dims, 'X1', x1, 'Y1', y1, 'X2', x2, 'Y2', y2)
+      let w = summedAreaTable.width;
+      let h = summedAreaTable.height;
+
+      let A = 0;
+      let B = 0;
+      let C = 0;
+      let D = 0;
+      if ( y1 > 0 && x1 > 0 ){
+        A = summedAreaTable.table[ (y1-1) * summedAreaTable.width + (x1-1)];
+      }
+      if ( y1 > 0 ){
+        B = summedAreaTable.table[ (y1-1) * summedAreaTable.width + x2];
+      }
+      if ( x1 > 0 ){
+        C = summedAreaTable.table[ (y2) * summedAreaTable.width + (x1-1) ]
+      }
+      D = summedAreaTable.table[ (y2) * summedAreaTable.width + x2 ];
+      let result = (D - B - C + A) / ((1 + y2 - y1) * (1 + x2 - x1));
+      //console.log('Dims', dims, 'Value', A, B, C, D)
+      return result;
+    }
+
+
+    switch (type) {
+      case 0 : {
+          // black over white
+          let b = getAreaSum(matrixDims[0]);
+          let w = getAreaSum(matrixDims[1]);
+          score = b - w
+        }
+        break;
+      case 1 : {
+          // white over black
+          let w = getAreaSum(matrixDims[0]);
+          let b = getAreaSum(matrixDims[1]);
+          if ( isNaN(b) ){
+            console.error(matrixDims)
+          }
+          score = w - b;
+        }
+        break;
+      case 2 : {
+          // black | white
+          let b = getAreaSum(matrixDims[0]);
+          let w = getAreaSum(matrixDims[1]);
+          score = b - w;
+      }
+      break;
+      case 3 : {
+          //  white | black
+          let b = getAreaSum(matrixDims[0]);
+          let w = getAreaSum(matrixDims[1]);
+          score = w - b;
+      }
+      break;
+      case 4 : {
+          //  white | black  OR black | white
+          let b = getAreaSum(matrixDims[0]);
+          let w = getAreaSum(matrixDims[1]);
+          score = Math.abs(w - b);
+      }
+      break;
+      case 5 : {
+          //  white over black  OR black over white
+          let b = getAreaSum(matrixDims[0]);
+          let w = getAreaSum(matrixDims[1]);
+          score = Math.abs(w - b);
+      }
+      break;
+      default :
+        console.error('Not implemented', type)
+    }
+
+    return score;
+  }
+
+
+  locatePercentCharacter(){
+
+    // 15x15 square
+    let mask = [
+      [    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0 ],
+      [    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,  255,  255,    0,    0,    0 ],
+      [    0,    0,  255,  255,  255,    0,    0,    0,    0,  255,  255,    0,    0,    0,    0 ],
+      [    0,  255,  255,  255,  255,  255,    0,    0,    0,  255,  255,    0,    0,    0,    0 ],
+      [    0,  255,  255,    0,  255,  255,    0,    0,  255,  255,    0,    0,    0,    0,    0 ],
+      [    0,  255,  255,    0,  255,  255,    0,    0,  255,  255,    0,    0,    0,    0,    0 ],
+      [    0,  255,  255,  255,  255,  255,    0,  255,  255,    0,    0,    0,    0,    0,    0 ],
+      [    0,    0,  255,  255,  255,    0,    0,  255,  255,    0,    0,    0,    0,    0,    0 ],
+      [    0,    0,    0,    0,    0,    0,    0,  255,    0,    0,  255,  255,  255,    0,    0 ],
+      [    0,    0,    0,    0,    0,    0,  255,  255,    0,  255,  255,  255,  255,  255,    0 ],
+      [    0,    0,    0,    0,    0,    0,  255,  255,    0,  255,  255,    0,  255,  255,    0 ],
+      [    0,    0,    0,    0,    0,  255,  255,    0,    0,  255,  255,    0,  255,  255,    0 ],
+      [    0,    0,    0,    0,  255,  255,  255,    0,    0,  255,  255,  255,  255,  255,    0 ],
+      [    0,    0,    0,    0,  255,  255,    0,    0,    0,    0,  255,  255,  255,    0,    0 ],
+      [    0,    0,    0,    0,  255,  255,    0,    0,    0,    0,    0,    0,    0,    0,    0 ],
+      [    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0 ],
+    ];
+
+    // Scan image to find this rectangle.
+
+    let result = []
+    let gridWidth = mask[0].length;
+    let gridHeight = mask.length;
+    let self = this;
+    let bestScore = 255 * (gridWidth * gridHeight) + 1;
+    
+    // find it in the top right corner of the image
+
+    for ( let x = Math.floor(this._width*0.75); x < this._width-gridWidth; x++ ){
+      for ( let y = 0; y < Math.floor(this._height*0.5) -gridHeight; y++ ){
+        let score = 0;
+        for ( let cx = 0; cx < gridWidth; cx++){
+          for ( let cy = 0; cy < gridHeight; cy++){
+            let px = ((y + cy) * this._width) + (x + cx) ;
+            score += Math.abs(mask[cy][cx] - self._buffer[px])
+          }
+        }
+        if ( score < bestScore ){
+          bestScore = score;
+          result = [x, y]
+        }
+      }
+    }
+
+    return result;    
+
+
+  }
+
+  percentageBlack(){
+    let score = 0;
+    let total = this._buffer.length;
+    for ( var i = 0; i < total; i++ ){
+      if ( this._buffer[i] < 200 ){
+        score++;
+      }
+    }
+    return score / total;
+
+  }
+
+
+  match(mask, colourSet, colours){
+    if ( colours.length == 0 ){
+      console.error(colours)
+      throw blah;
+    }
+
+    // // cosine similarity
+
+    // if ( this._buffer.length !== mask._buffer.length ){
+    //   console.error('Different lengths')
+    // }
+
+    // let a = 0;
+    // let aa = 0;
+    // let bb = 0;
+    // for ( var i = 0; i < this._buffer.length; i++ ){
+    //   a += this._buffer[i] * mask._buffer[i]
+    //   aa += this._buffer[i] * this._buffer[i]
+    //   bb += mask._buffer[i] * mask._buffer[i]
+    // }
+
+    // let similarity = a / ( Math.sqrt(aa) * Math.sqrt(bb) );
+
+
+    // Only compare white pixels of mask and their immediate neighbours
+
+    let shouldMatch = 0;
+    let doesMatch = 0;
+    let windowSize = 0; // Plus/Minus this value!
+    let self = this;
+
+    // Find top and left of mask
+
+    let top = this._height;
+    let left = this._width;
+    for (var y = 0; y < this._height; y++) {
+      for (var x = 0; x < this._width; x++) {
+        let idx = ((y) * this._width + (x));
+        if ( mask._buffer[idx] > 200 ){
+          if ( y < top ){
+            top = y;
+          }
+          if ( x < left ){
+            left = x;
+          }
+        }
+      }
+    }
+
+
+    for (var y = top; y < this._height; y++) {
+      for (var x = left; x < this._width; x++) {
+        let idx = ((y) * this._width + (x));
+        shouldMatch ++;
+        if ( mask._buffer[idx] > 200 && self._buffer[idx] > 200 ){
+          doesMatch++;
+        }
+        if ( mask._buffer[idx] < 200 && self._buffer[idx] < 200){
+          doesMatch++;
+        }
+      }
+    }
+
+    //console.log('Matching', colours, 'scored', doesMatch, shouldMatch)
+    // for (var y = 0; y < this._height; y++) {
+    //   for (var x = 0; x < this._width; x++) {
+    //     let px = ((y) * this._width + (x));
+    //     if ( mask._buffer[px] > 200 ){
+    //       shouldMatch ++;
+    //       if ( this._buffer[px] > 200 ){
+    //         doesMatch++;
+    //       }
+    //     }
+    //   }
+    // }
+    let similarity = doesMatch / shouldMatch;
+    return similarity
+
+  }
+
+}
+
+
+
+
+      </script>
+        
+    </body>
+</html>
